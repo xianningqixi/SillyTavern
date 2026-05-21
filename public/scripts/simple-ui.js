@@ -18,6 +18,7 @@ const emptyTemplate = document.getElementById('empty-template');
 const imageToggle = document.getElementById('image-toggle');
 const backButton = document.getElementById('back-button');
 const randomButton = document.getElementById('random-button');
+const modButton = document.getElementById('mod-button');
 const worldBookButton = document.getElementById('worldbook-button');
 const createStoryButton = document.getElementById('create-story-button');
 const createCharacterButton = document.getElementById('create-character-button');
@@ -100,6 +101,8 @@ const state = {
     view: localStorage.getItem('simpleViewMode') || 'simple',
     messageLoadKey: '',
     modelNotice: null,
+    modNotice: null,
+    editingModId: '',
     editingModelProfileId: '',
     selectedWorldBook: '',
     editingWorldEntryUid: null,
@@ -130,6 +133,15 @@ function setModelNotice(message, tone = '', detail = '') {
             minute: '2-digit',
             second: '2-digit',
         }).format(new Date()),
+    };
+    setStatus(message, tone);
+}
+
+function setModNotice(message, tone = '', detail = '') {
+    state.modNotice = {
+        message,
+        tone,
+        detail,
     };
     setStatus(message, tone);
 }
@@ -959,11 +971,13 @@ function renderSidebarState() {
     const isBrowse = state.page === 'browse';
     const isSettings = state.route?.type === 'settings';
     const isWorldBooks = state.route?.type === 'worldbooks';
+    const isMods = state.route?.type === 'mods';
     document.querySelectorAll('.simple-nav [data-tab]').forEach((button) => {
         button.classList.toggle('is-active', isBrowse && button.dataset.tab === state.tab);
     });
     modelSettingsButton.classList.toggle('is-active', isSettings);
     worldBookButton.classList.toggle('is-active', isWorldBooks);
+    modButton.classList.toggle('is-active', isMods);
 }
 
 function renderModeButtons() {
@@ -1297,7 +1311,7 @@ async function saveServerChat(character, messages) {
     });
 }
 
-function getSimpleSystemPrompt(character, worldInfoText = '') {
+function getSimpleSystemPrompt(character, worldInfoText = '', modInfoText = '') {
     const personality = normalizeText(character.data?.personality || character.personality);
     const scenario = normalizeText(character.data?.scenario || character.scenario);
     const pieces = [
@@ -1306,6 +1320,7 @@ function getSimpleSystemPrompt(character, worldInfoText = '') {
         personality ? `性格：${personality}` : '',
         scenario ? `场景：${scenario}` : '',
         worldInfoText ? `世界书：\n${worldInfoText}` : '',
+        modInfoText ? `已启用MOD：\n${modInfoText}` : '',
         '保持角色口吻，直接回应用户，不要解释你是模型。',
     ].filter(Boolean);
 
@@ -1357,18 +1372,19 @@ async function buildGeneratePayload(character, sourceMessages = state.chatMessag
     }));
     const scanText = recentMessages.map(message => message.content).join('\n');
     const worldInfoText = await getWorldInfoText(getActiveWorldBookName(character), scanText);
+    const modInfoText = getActiveModsText();
     const messages = [
-        { role: 'system', content: getSimpleSystemPrompt(character, worldInfoText) },
+        { role: 'system', content: getSimpleSystemPrompt(character, worldInfoText, modInfoText) },
         ...recentMessages,
     ];
     return buildChatCompletionPayload(config, messages, character);
 }
 
-async function buildTestGeneratePayload({ profileId, character, worldBookName, messages, scanText }) {
+async function buildTestGeneratePayload({ profileId, character, worldBookName, messages, scanText, modInfoText = '' }) {
     const config = getModelProfileById(profileId || getDefaultModelProfileId());
     const worldInfoText = await getWorldInfoText(worldBookName, scanText);
     return buildChatCompletionPayload(config, [
-        { role: 'system', content: getSimpleSystemPrompt(character, worldInfoText) },
+        { role: 'system', content: getSimpleSystemPrompt(character, worldInfoText, modInfoText) },
         ...messages,
     ], character);
 }
@@ -1401,6 +1417,25 @@ async function clearChatModelOverride(character) {
     delete state.chatMetadata.model_profile_id;
     delete state.chatMetadata.model_settings;
     delete state.chatMetadata.world_info;
+    await saveServerChat(character, state.chatMessages);
+}
+
+async function saveChatModOverride(character, modIds) {
+    const validIds = new Set(getMods().map(mod => mod.id));
+    state.chatMetadata = {
+        ...(state.chatMetadata || {}),
+        simple_ui: true,
+        simple_ui_mod_ids: modIds.filter(id => validIds.has(id)),
+    };
+    await saveServerChat(character, state.chatMessages);
+}
+
+async function clearChatModOverride(character) {
+    state.chatMetadata = {
+        ...(state.chatMetadata || {}),
+        simple_ui: true,
+    };
+    delete state.chatMetadata.simple_ui_mod_ids;
     await saveServerChat(character, state.chatMessages);
 }
 
@@ -1928,6 +1963,83 @@ function createSafeFileBase(value, fallback) {
 function createStoryFileName(title) {
     const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
     return `${createSafeFileBase(title, 'Simple Story')} - ${stamp}`;
+}
+
+function createModId() {
+    return `mod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getStoredMods() {
+    const mods = state.settings?.simple_ui_mods?.mods;
+    return Array.isArray(mods) ? mods : [];
+}
+
+function normalizeMod(mod = {}) {
+    return {
+        id: normalizeText(mod.id) || createModId(),
+        name: normalizeText(mod.name) || '新MOD',
+        description: normalizeText(mod.description),
+        tags: Array.isArray(mod.tags) ? mod.tags.map(normalizeText).filter(Boolean) : parseTags(mod.tags),
+        prompt: String(mod.prompt || '').trim(),
+        enabledDefault: Boolean(mod.enabledDefault),
+    };
+}
+
+function getMods() {
+    return getStoredMods().map(mod => normalizeMod(mod));
+}
+
+function getModById(id) {
+    const mods = getMods();
+    return mods.find(mod => mod.id === id) || mods[0] || normalizeMod({ id: '', name: '新MOD' });
+}
+
+function getUniqueModName(name, mods) {
+    const existingNames = new Set(mods.map(mod => normalizeText(mod.name)));
+    if (!existingNames.has(name)) {
+        return name;
+    }
+
+    for (let index = 2; index < 100; index += 1) {
+        const candidate = `${name} ${index}`;
+        if (!existingNames.has(candidate)) {
+            return candidate;
+        }
+    }
+
+    return `${name} ${Date.now().toString(36)}`;
+}
+
+function getDefaultModIds() {
+    return getMods().filter(mod => mod.enabledDefault).map(mod => mod.id);
+}
+
+function getChatModIds() {
+    const savedIds = state.chatMetadata?.simple_ui_mod_ids;
+    if (Array.isArray(savedIds)) {
+        return savedIds.map(normalizeText).filter(Boolean);
+    }
+
+    return getDefaultModIds();
+}
+
+function getActiveMods() {
+    const selectedIds = new Set(getChatModIds());
+    return getMods().filter(mod => selectedIds.has(mod.id) && mod.prompt);
+}
+
+function getActiveModsText() {
+    return getActiveMods()
+        .map((mod, index) => `MOD ${index + 1} - ${mod.name}\n${mod.prompt}`)
+        .join('\n\n');
+}
+
+function renderModNotice() {
+    if (!state.modNotice) {
+        return null;
+    }
+
+    return createNotice(state.modNotice.message, state.modNotice.tone, state.modNotice.detail);
 }
 
 function renderCharacterCreatePage() {
@@ -2732,6 +2844,247 @@ async function deleteSelectedWorldBook(name) {
     renderWorldBookPage();
 }
 
+function renderModsPage() {
+    listEl.replaceChildren();
+    detailEl.replaceChildren();
+    listEl.className = 'simple-page-detail simple-config-page';
+    detailEl.className = 'simple-detail simple-side-panel';
+    viewKicker.textContent = '提示词 MOD 管理';
+    viewTitle.textContent = 'MOD';
+
+    const mods = getMods();
+    if (!state.modNotice) {
+        setStatus(`已载入 ${mods.length} 个 MOD`);
+    }
+    if (!state.editingModId) {
+        state.editingModId = mods[0]?.id || '__new__';
+    }
+    if (state.editingModId !== '__new__' && !mods.some(mod => mod.id === state.editingModId)) {
+        state.editingModId = mods[0]?.id || '__new__';
+    }
+
+    const isCreating = state.editingModId === '__new__' || !mods.length;
+    const mod = isCreating ? normalizeMod({ id: '', name: '新MOD' }) : getModById(state.editingModId);
+    const form = document.createElement('form');
+    form.className = 'simple-settings-form simple-card-editor';
+
+    const name = createInput('text', mod.name);
+    name.required = true;
+    name.maxLength = 60;
+    const description = createTextarea(mod.description, 3);
+    const tags = createInput('text', mod.tags.join('，'));
+    const prompt = createTextarea(mod.prompt, 9);
+    prompt.required = true;
+    prompt.placeholder = '写入要追加到系统提示词里的规则，例如叙事风格、回复格式、互动限制、玩法规则。';
+    const enabledDefault = document.createElement('input');
+    enabledDefault.type = 'checkbox';
+    enabledDefault.checked = mod.enabledDefault;
+
+    appendField(form, 'MOD 名称', name);
+    appendField(form, '说明', description, '只用于管理列表，不会发送给模型。');
+    appendField(form, '标签', tags, '用中文逗号、英文逗号或换行分隔。');
+    appendField(form, '提示词规则', prompt, '会在当前聊天启用后注入 system prompt，可和世界书、角色卡一起生效。');
+    appendField(form, '默认启用', enabledDefault, '新聊天或未指定 MOD 的聊天会自动使用默认启用项。');
+
+    const actions = document.createElement('div');
+    actions.className = 'simple-form-actions';
+    const save = createButton('保存MOD', 'fa-floppy-disk', 'simple-primary');
+    const saveAs = createButton('另存为新MOD', 'fa-copy', '');
+    const create = createButton('新建MOD', 'fa-plus', '');
+    const importButton = createButton('导入MOD', 'fa-file-import', '');
+    const exportButton = createButton('导出全部', 'fa-file-export', '');
+    const importInput = document.createElement('input');
+    importInput.type = 'file';
+    importInput.accept = '.json,application/json';
+    importInput.multiple = true;
+    importInput.hidden = true;
+    save.type = 'submit';
+    saveAs.type = 'submit';
+    create.type = 'button';
+    importButton.type = 'button';
+    exportButton.type = 'button';
+    actions.append(save, saveAs, create, importButton, exportButton, importInput);
+    form.append(actions);
+
+    const notice = renderModNotice();
+    if (notice) {
+        form.append(notice);
+    }
+
+    form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        await saveModSettings({
+            id: isCreating || event.submitter === saveAs ? '' : mod.id,
+            name: name.value,
+            description: description.value,
+            tags: tags.value,
+            prompt: prompt.value,
+            enabledDefault: enabledDefault.checked,
+        }, isCreating || event.submitter === saveAs);
+    });
+
+    create.addEventListener('click', () => {
+        state.editingModId = '__new__';
+        state.modNotice = null;
+        renderModsPage();
+    });
+    importButton.addEventListener('click', () => importInput.click());
+    importInput.addEventListener('change', async () => {
+        try {
+            await importMods([...importInput.files]);
+        } catch (error) {
+            console.error(error);
+            setModNotice(`MOD 导入失败：${error.message || '未知错误'}`, 'error');
+            renderModsPage();
+        } finally {
+            importInput.value = '';
+        }
+    });
+    exportButton.disabled = !mods.length;
+    exportButton.addEventListener('click', exportMods);
+    listEl.append(form);
+
+    const modList = document.createElement('div');
+    modList.className = 'simple-profile-list';
+    if (!mods.length) {
+        modList.append(createTextBlock('还没有 MOD。左侧保存一个规则包后，就可以在聊天页选择启用。'));
+    }
+    for (const item of mods) {
+        const card = document.createElement('article');
+        card.className = `simple-profile-card${item.id === mod.id && !isCreating ? ' is-selected' : ''}`;
+        const heading = document.createElement('strong');
+        heading.textContent = item.name;
+        const meta = createFullMeta([
+            item.enabledDefault ? '默认启用' : '',
+            item.tags.length ? item.tags.join(' / ') : '',
+            item.description || '无说明',
+        ]);
+        const preview = document.createElement('p');
+        preview.className = 'simple-mod-preview';
+        preview.textContent = item.prompt || '没有提示词规则。';
+        const buttons = document.createElement('div');
+        buttons.className = 'simple-profile-actions';
+        const edit = createButton('编辑', 'fa-pen', '');
+        const toggleDefault = createButton(item.enabledDefault ? '取消默认' : '默认启用', 'fa-star', '');
+        const duplicate = createButton('复制', 'fa-copy', '');
+        const remove = createButton('删除', 'fa-trash', 'simple-danger');
+        edit.addEventListener('click', () => {
+            state.editingModId = item.id;
+            state.modNotice = null;
+            renderModsPage();
+        });
+        toggleDefault.addEventListener('click', () => saveModSettings({ ...item, enabledDefault: !item.enabledDefault }, false));
+        duplicate.addEventListener('click', () => saveModSettings({ ...item, id: '', name: `${item.name} 副本` }, true));
+        remove.addEventListener('click', () => deleteMod(item.id));
+        buttons.append(edit, toggleDefault, duplicate, remove);
+        card.append(heading, meta, preview, buttons);
+        modList.append(card);
+    }
+    detailEl.append(createSection('已保存 MOD', modList));
+}
+
+async function saveModSettings(config, shouldCreateNew = false) {
+    try {
+        const name = normalizeText(config.name);
+        const prompt = String(config.prompt || '').trim();
+        if (!name) {
+            throw new Error('MOD 名称不能为空');
+        }
+        if (!prompt) {
+            throw new Error('提示词规则不能为空');
+        }
+        if (!state.settings) {
+            await loadSettings();
+        }
+
+        const currentMods = getMods();
+        const existing = shouldCreateNew ? null : currentMods.find(mod => mod.id === config.id);
+        const mod = normalizeMod({
+            ...config,
+            id: existing?.id || config.id || createModId(),
+            name: existing ? name : getUniqueModName(name, currentMods),
+            prompt,
+        });
+        const mods = existing
+            ? currentMods.map(item => item.id === existing.id ? mod : item)
+            : [...currentMods, mod];
+
+        await saveSettings({
+            ...state.settings,
+            simple_ui_mods: { mods },
+        });
+        state.editingModId = mod.id;
+        setModNotice('MOD 已保存', 'success', mod.name);
+        renderModsPage();
+    } catch (error) {
+        console.error(error);
+        setModNotice(`MOD 保存失败：${error.message || '未知错误'}`, 'error');
+        renderModsPage();
+    }
+}
+
+async function deleteMod(modId) {
+    const mod = getModById(modId);
+    if (!mod || !window.confirm(`删除 MOD“${mod.name}”？`)) {
+        return;
+    }
+    const mods = getMods().filter(item => item.id !== modId);
+    await saveSettings({
+        ...state.settings,
+        simple_ui_mods: { mods },
+    });
+    state.editingModId = mods[0]?.id || '__new__';
+    setModNotice('MOD 已删除', 'success', mod.name);
+    renderModsPage();
+}
+
+function exportMods() {
+    const mods = getMods();
+    downloadFile(JSON.stringify({ mods }, null, 4), 'aibar-mods.json', 'application/json');
+    setModNotice('MOD 已导出', 'success', `${mods.length} 个规则包`);
+    renderModsPage();
+}
+
+async function importMods(files) {
+    if (!files.length) {
+        return;
+    }
+    let nextMods = getMods();
+    let count = 0;
+    for (const file of files) {
+        const json = JSON.parse(await file.text());
+        const imported = Array.isArray(json)
+            ? json
+            : Array.isArray(json.mods)
+                ? json.mods
+                : Array.isArray(json.simple_ui_mods?.mods)
+                    ? json.simple_ui_mods.mods
+                    : [];
+        if (!imported.length) {
+            throw new Error(`${file.name} 里没有 mods 数组`);
+        }
+        for (const item of imported) {
+            const mod = normalizeMod({
+                ...item,
+                id: createModId(),
+                name: getUniqueModName(normalizeText(item.name) || '导入MOD', nextMods),
+            });
+            if (!mod.prompt) {
+                continue;
+            }
+            nextMods = [...nextMods, mod];
+            count += 1;
+        }
+    }
+    await saveSettings({
+        ...state.settings,
+        simple_ui_mods: { mods: nextMods },
+    });
+    state.editingModId = nextMods.at(-1)?.id || state.editingModId;
+    setModNotice(`已导入 ${count} 个 MOD`, count ? 'success' : 'pending');
+    renderModsPage();
+}
+
 function renderModelSettingsPage() {
     listEl.replaceChildren();
     detailEl.replaceChildren();
@@ -3166,6 +3519,102 @@ function renderChatModelPanel(character, container) {
     container.append(form);
 }
 
+function renderChatModPanel(character, container) {
+    container.replaceChildren();
+    const mods = getMods();
+    const selectedIds = new Set(getChatModIds());
+    const isOverride = Array.isArray(state.chatMetadata?.simple_ui_mod_ids);
+    const form = document.createElement('form');
+    form.className = 'simple-chat-model-form';
+
+    if (!mods.length) {
+        form.append(createNotice('还没有可用 MOD', 'pending', '先在 MOD 页面创建规则包，然后回到聊天里选择启用。'));
+        const create = createButton('创建MOD', 'fa-plus', 'simple-primary');
+        create.addEventListener('click', navigateMods);
+        const actions = document.createElement('div');
+        actions.className = 'simple-form-actions simple-stacked-actions';
+        actions.append(create);
+        form.append(actions);
+        container.append(form);
+        return;
+    }
+
+    const list = document.createElement('div');
+    list.className = 'simple-check-list';
+    for (const mod of mods) {
+        const row = document.createElement('label');
+        row.className = 'simple-check-row';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = mod.id;
+        checkbox.checked = selectedIds.has(mod.id);
+        const text = document.createElement('span');
+        const title = document.createElement('strong');
+        title.textContent = mod.name;
+        const meta = document.createElement('span');
+        meta.textContent = [
+            mod.enabledDefault ? '默认启用' : '',
+            mod.tags.length ? mod.tags.join(' / ') : '',
+            mod.description,
+        ].filter(Boolean).join(' · ') || '无描述';
+        text.append(title, meta);
+        row.append(checkbox, text);
+        list.append(row);
+    }
+    form.append(list);
+
+    const actions = document.createElement('div');
+    actions.className = 'simple-form-actions simple-stacked-actions';
+    const apply = createButton('应用到当前聊天', 'fa-check', 'simple-primary');
+    const reset = createButton('使用默认MOD', 'fa-rotate-left', '');
+    const manage = createButton('管理MOD', 'fa-sliders', '');
+    apply.type = 'submit';
+    reset.type = 'button';
+    manage.type = 'button';
+    apply.disabled = !state.chatLoaded;
+    reset.disabled = !state.chatLoaded || !isOverride;
+    actions.append(apply, reset, manage);
+    form.append(actions);
+
+    const status = createNotice(
+        isOverride ? '当前聊天使用指定 MOD' : '当前聊天使用默认 MOD',
+        selectedIds.size ? 'success' : 'pending',
+        selectedIds.size ? `已启用 ${selectedIds.size} 个 MOD` : '未启用 MOD',
+    );
+    form.append(status);
+
+    form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        apply.disabled = true;
+        try {
+            const nextIds = [...form.querySelectorAll('input[type="checkbox"]:checked')].map(input => input.value);
+            await saveChatModOverride(character, nextIds);
+            setStatus(`当前聊天已启用 ${nextIds.length} 个 MOD`);
+        } catch (error) {
+            console.error(error);
+            setStatus(`当前聊天 MOD 保存失败：${error.message || '未知错误'}`, 'error');
+        } finally {
+            renderChatModPanel(character, container);
+        }
+    });
+
+    reset.addEventListener('click', async () => {
+        reset.disabled = true;
+        try {
+            await clearChatModOverride(character);
+            setStatus('当前聊天已恢复默认 MOD');
+        } catch (error) {
+            console.error(error);
+            setStatus(`恢复默认 MOD 失败：${error.message || '未知错误'}`, 'error');
+        } finally {
+            renderChatModPanel(character, container);
+        }
+    });
+
+    manage.addEventListener('click', navigateMods);
+    container.append(form);
+}
+
 async function createNewChat(character) {
     const title = normalizeText(window.prompt('新聊天名称', `${character.name || '角色'} - 新聊天`));
     if (!title) {
@@ -3389,6 +3838,8 @@ function renderChatPage(character) {
     messages.className = 'simple-live-messages';
     const modelPanel = document.createElement('div');
     renderChatModelPanel(character, modelPanel);
+    const modPanel = document.createElement('div');
+    renderChatModPanel(character, modPanel);
     const chatManagerPanel = document.createElement('div');
 
     const form = document.createElement('form');
@@ -3401,7 +3852,10 @@ function renderChatPage(character) {
     send.type = 'submit';
     send.disabled = true;
     clear.type = 'button';
-    form.append(textarea, send, clear);
+    const formActions = document.createElement('div');
+    formActions.className = 'simple-chat-actions';
+    formActions.append(send, clear);
+    form.append(textarea, formActions);
 
     form.addEventListener('submit', async (event) => {
         event.preventDefault();
@@ -3444,6 +3898,7 @@ function renderChatPage(character) {
             renderChatMessages(messages, character);
             state.chatLoaded = true;
             renderChatModelPanel(character, modelPanel);
+            renderChatModPanel(character, modPanel);
             renderChatManagerPanel(character, chatManagerPanel, messages, send);
             setStatus(`已载入服务器聊天：${getCharacterChatName(character)}`);
         })
@@ -3453,6 +3908,7 @@ function renderChatPage(character) {
             state.chatLoaded = true;
             renderChatMessages(messages, character);
             renderChatModelPanel(character, modelPanel);
+            renderChatModPanel(character, modPanel);
             renderChatManagerPanel(character, chatManagerPanel, messages, send);
             setStatus('服务器聊天读取失败，已打开空聊天', 'error');
         })
@@ -3462,6 +3918,7 @@ function renderChatPage(character) {
 
     detailEl.append(renderCharacterSummary(character));
     detailEl.append(createSection('当前聊天模型', modelPanel));
+    detailEl.append(createSection('当前聊天MOD', modPanel));
     detailEl.append(createSection('聊天管理', chatManagerPanel));
     appendDetailActions(detailEl, '模型配置', () => navigateSettings(), [{
         label: '设为当前角色',
@@ -3560,7 +4017,7 @@ async function continueLastReply(character, container, triggerButton) {
 
 function renderPage() {
     let pageType = 'detail';
-    if (state.route.type === 'settings' || state.route.type === 'worldbooks') {
+    if (state.route.type === 'settings' || state.route.type === 'worldbooks' || state.route.type === 'mods') {
         pageType = 'settings';
     } else if (state.route.type === 'chat') {
         pageType = 'chat';
@@ -3590,6 +4047,11 @@ function renderPage() {
 
     if (state.route.type === 'worldbooks') {
         renderWorldBookPage();
+        return;
+    }
+
+    if (state.route.type === 'mods') {
+        renderModsPage();
         return;
     }
 
@@ -3675,6 +4137,12 @@ function getRouteFromLocation() {
         };
     }
     if (type === 'worldbooks') {
+        return {
+            page: 'detail',
+            type,
+        };
+    }
+    if (type === 'mods') {
         return {
             page: 'detail',
             type,
@@ -3778,6 +4246,14 @@ function navigateSettings() {
 function navigateWorldBooks() {
     const route = { page: 'detail', type: 'worldbooks' };
     history.pushState(route, '', '/simple?type=worldbooks');
+    state.page = 'detail';
+    state.route = route;
+    render();
+}
+
+function navigateMods() {
+    const route = { page: 'detail', type: 'mods' };
+    history.pushState(route, '', '/simple?type=mods');
     state.page = 'detail';
     state.route = route;
     render();
@@ -3977,6 +4453,7 @@ document.getElementById('refresh-button').addEventListener('click', async () => 
 });
 
 modelSettingsButton.addEventListener('click', navigateSettings);
+modButton.addEventListener('click', navigateMods);
 worldBookButton.addEventListener('click', navigateWorldBooks);
 createStoryButton.addEventListener('click', navigateCreateStory);
 createCharacterButton.addEventListener('click', navigateCreateCharacter);
