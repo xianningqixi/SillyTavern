@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <title>AIBAR 本地工坊</title>
+    <base href="/">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, viewport-fit=cover, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="theme-color" content="#101311">
+    <link href="webfonts/NotoSans/stylesheet.css" rel="stylesheet">
+    <link href="webfonts/NotoSansMono/stylesheet.css" rel="stylesheet">
+    <link href="css/fontawesome.min.css" rel="stylesheet">
+    <link href="css/solid.min.css" rel="stylesheet">
+    <link href="css/simple-ui.css" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+</head>
+
+<body>
+    <div id="simple-app" class="simple-shell" data-view="simple" data-page="browse">
+        <aside class="simple-sidebar">
+            <a class="simple-brand" href="/simple" aria-label="AIBAR 本地工坊">
+                <span class="simple-brand-mark" aria-hidden="true"><i class="fa-solid fa-layer-group"></i></span>
+                <span>AIBAR 本地工坊</span>
+            </a>
+            <nav class="simple-nav" aria-label="Simple navigation">
+                <button class="is-active" data-tab="all" type="button"><i class="fa-solid fa-compass"></i><span>探索</span></button>
+                <button data-tab="recent" type="button"><i class="fa-solid fa-clock-rotate-left"></i><span>最近</span></button>
+                <button data-tab="favorite" type="button"><i class="fa-solid fa-star"></i><span>收藏</span></button>
+                <button data-tab="withChats" type="button"><i class="fa-solid fa-message"></i><span>有聊天</span></button>
+            </nav>
+            <div class="simple-sidebar-actions">
+                <button id="refresh-button" type="button"><i class="fa-solid fa-rotate"></i><span>刷新角色</span></button>
+                <button id="model-settings-button" type="button"><i class="fa-solid fa-plug-circle-bolt"></i><span>模型配置</span></button>
+            </div>
+            <div class="simple-status" id="simple-status">正在载入本地角色库</div>
+        </aside>
+
+        <main class="simple-main">
+            <header class="simple-header">
+                <div>
+                    <p id="view-kicker" class="simple-kicker">本地角色库</p>
+                    <h1 id="view-title">本地工坊</h1>
+                </div>
+                <div class="simple-header-actions">
+                    <button id="back-button" type="button" hidden><i class="fa-solid fa-arrow-left"></i><span>返回</span></button>
+                    <button id="worldbook-button" type="button"><i class="fa-solid fa-book-atlas"></i><span>世界书</span></button>
+                    <button id="create-story-button" type="button"><i class="fa-solid fa-pen-nib"></i><span>写故事</span></button>
+                    <button id="create-character-button" type="button"><i class="fa-solid fa-user-plus"></i><span>写角色</span></button>
+                    <button id="random-button" class="simple-primary" type="button"><i class="fa-solid fa-shuffle"></i><span>随机</span></button>
+                    <button id="image-toggle" type="button"><i class="fa-solid fa-image"></i><span>无图</span></button>
+                </div>
+            </header>
+
+            <section class="simple-mode-tabs" aria-label="Card type">
+                <button class="is-active" data-mode="stories" type="button"><i class="fa-solid fa-book-open"></i><span>故事卡</span></button>
+                <button data-mode="characters" type="button"><i class="fa-solid fa-id-card"></i><span>角色卡</span></button>
+            </section>
+
+            <section class="simple-toolbar" aria-label="Search and filters">
+                <label class="simple-search">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input id="search-input" type="search" placeholder="搜索角色、作者、标签、简介" autocomplete="off">
+                </label>
+                <select id="sort-select" aria-label="排序">
+                    <option value="recent">最近聊天</option>
+                    <option value="added">最近添加</option>
+                    <option value="name">名称</option>
+                    <option value="size">聊天最多</option>
+                </select>
+            </section>
+
+            <section class="simple-tabs" aria-label="Ranking filters">
+                <button class="is-active" data-tab="all" type="button">全部</button>
+                <button data-tab="recent" type="button">最近</button>
+                <button data-tab="favorite" type="button">收藏</button>
+                <button data-tab="withChats" type="button">有聊天</button>
+            </section>
+
+            <section class="simple-metrics" aria-label="Character metrics">
+                <div><strong id="metric-total">0</strong><span id="metric-total-label">故事</span></div>
+                <div><strong id="metric-chats">0</strong><span id="metric-chats-label">消息</span></div>
+                <div><strong id="metric-favs">0</strong><span id="metric-favs-label">角色故事</span></div>
+            </section>
+
+            <section class="simple-tags" id="tag-strip" aria-label="Popular tags"></section>
+
+            <section class="simple-content">
+                <div id="character-list" class="simple-list" aria-live="polite"></div>
+                <aside id="character-detail" class="simple-detail" aria-live="polite"></aside>
+            </section>
+        </main>
+    </div>
+
+    <template id="empty-template">
+        <div class="simple-empty">
+            <i class="fa-solid fa-folder-open"></i>
+            <h2>没有找到内容</h2>
+            <p>换个关键词或回到全部列表。</p>
+        </div>
+    </template>
+
+    <script type="module" src="scripts/simple-ui.js"></script>
+</body>
+
+</html>

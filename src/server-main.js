@@ -235,6 +235,17 @@ app.get('/callback/:source?', (request, response) => {
 // Host login page
 app.get('/login', loginPageMiddleware);
 
+// Host simplified character launcher
+app.get(['/simple', '/simple.html'], cacheBuster.middleware, (request, response) => {
+    if (shouldRedirectToLogin(request)) {
+        const query = request.url.split('?')[1];
+        const redirectUrl = query ? `/login?${query}` : '/login';
+        return response.redirect(redirectUrl);
+    }
+
+    return response.sendFile('simple.html', { root: path.join(serverDirectory, 'public') });
+});
+
 // Host frontend assets
 const webpackMiddleware = getWebpackServeMiddleware();
 app.use(webpackMiddleware);
