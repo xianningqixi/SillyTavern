@@ -425,6 +425,74 @@ router.post('/electronhub/models', async (request, response) => {
     }
 });
 
+// Xiaomi MiMo TTS — uses /v1/chat/completions with audio output, returns base64-encoded audio
+router.post('/mimo/generate-voice', async (request, response) => {
+    try {
+        const key = readSecret(request.user.directories, SECRET_KEYS.MIMO);
+
+        if (!key) {
+            console.warn('No MiMo key found');
+            return response.sendStatus(400);
+        }
+
+        const text = request.body.text ?? request.body.input;
+        if (!text) {
+            return response.status(400).send('Missing text');
+        }
+
+        const model = request.body.model || 'mimo-v2.5-tts';
+        const requestedVoice = request.body.voice || '冰糖';
+        const voice = requestedVoice === 'mimo_default' || requestedVoice === 'default_zh'
+            ? '冰糖'
+            : requestedVoice === 'default_en' ? 'Mia' : requestedVoice;
+        const format = (request.body.format || 'wav').toLowerCase();
+        const baseUrl = (request.body.base_url || 'https://api.xiaomimimo.com/v1').replace(/\/+$/, '');
+
+        const requestBody = {
+            model,
+            messages: [{ role: 'assistant', content: text }],
+            audio: { format, voice },
+        };
+
+        console.debug('MiMo TTS request', { model, voice, format, textLen: text.length });
+
+        const result = await fetch(`${baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'api-key': key,
+                Authorization: `Bearer ${key}`,
+            },
+            body: JSON.stringify(requestBody),
+        });
+
+        if (!result.ok) {
+            const errText = await result.text();
+            console.warn('MiMo TTS request failed', result.status, result.statusText, errText);
+            return response.status(500).send(errText);
+        }
+
+        /** @type {any} */
+        const data = await result.json();
+        const audioB64 = data?.choices?.[0]?.message?.audio?.data;
+        if (!audioB64 || typeof audioB64 !== 'string') {
+            console.warn('MiMo TTS: no audio data in response', JSON.stringify(data).slice(0, 500));
+            return response.status(500).send('No audio data in MiMo response');
+        }
+
+        const buffer = Buffer.from(audioB64, 'base64');
+        const contentType = format === 'mp3'
+            ? 'audio/mpeg'
+            : format === 'wav' ? 'audio/wav'
+                : format === 'pcm16' ? 'audio/pcm' : 'application/octet-stream';
+        response.setHeader('Content-Type', contentType);
+        return response.send(buffer);
+    } catch (error) {
+        console.error('MiMo TTS generation failed', error);
+        response.status(500).send('Internal server error');
+    }
+});
+
 // Chutes TTS
 router.post('/chutes/generate-voice', async (request, response) => {
     try {
