@@ -705,13 +705,27 @@ router.post('/generate-image', async (request, response) => {
 
         console.debug('OpenAI request', request.body);
 
-        const result = await fetch('https://api.openai.com/v1/images/generations', {
+        const requestBody = { ...request.body };
+        const reverseProxy = String(requestBody.reverse_proxy || requestBody.base_url || '').trim();
+        delete requestBody.reverse_proxy;
+        delete requestBody.base_url;
+
+        let apiUrl = 'https://api.openai.com/v1/images/generations';
+        if (reverseProxy) {
+            const url = new URL(reverseProxy);
+            if (!url.pathname.replace(/\/+$/, '').endsWith('/images/generations')) {
+                url.pathname = `${url.pathname.replace(/\/+$/, '')}/images/generations`;
+            }
+            apiUrl = url.toString();
+        }
+
+        const result = await fetch(apiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${key}`,
             },
-            body: JSON.stringify(request.body),
+            body: JSON.stringify(requestBody),
         });
 
         if (!result.ok) {
