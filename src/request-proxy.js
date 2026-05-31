@@ -41,9 +41,16 @@ export default function initRequestProxy({ enabled, url, bypass, enableKeepAlive
         // ProxyAgent uses proxy-from-env under the hood
         // Reference: https://github.com/Rob--W/proxy-from-env
         process.env.all_proxy = url;
+        process.env.ALL_PROXY = url;
+        process.env.http_proxy = url;
+        process.env.HTTP_PROXY = url;
+        process.env.https_proxy = url;
+        process.env.HTTPS_PROXY = url;
 
         if (Array.isArray(bypass) && bypass.length > 0) {
-            process.env.no_proxy = bypass.join(',');
+            const bypassList = bypass.join(',');
+            process.env.no_proxy = bypassList;
+            process.env.NO_PROXY = bypassList;
         }
 
         const httpAgent = http.globalAgent;
