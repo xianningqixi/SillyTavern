@@ -445,16 +445,20 @@ router.post('/mimo/generate-voice', async (request, response) => {
         const voice = requestedVoice === 'mimo_default' || requestedVoice === 'default_zh'
             ? '冰糖'
             : requestedVoice === 'default_en' ? 'Mia' : requestedVoice;
+        const isVoiceDesign = model === 'mimo-v2.5-tts-voicedesign';
+        const stylePrompt = String(request.body.style_prompt || request.body.prompt || (isVoiceDesign ? voice : '') || '').trim();
         const format = (request.body.format || 'wav').toLowerCase();
         const baseUrl = (request.body.base_url || 'https://api.xiaomimimo.com/v1').replace(/\/+$/, '');
 
         const requestBody = {
             model,
-            messages: [{ role: 'assistant', content: text }],
-            audio: { format, voice },
+            messages: stylePrompt
+                ? [{ role: 'user', content: stylePrompt }, { role: 'assistant', content: text }]
+                : [{ role: 'assistant', content: text }],
+            audio: isVoiceDesign ? { format } : { format, voice },
         };
 
-        console.debug('MiMo TTS request', { model, voice, format, textLen: text.length });
+        console.debug('MiMo TTS request', { model, voice, hasStylePrompt: Boolean(stylePrompt), format, textLen: text.length });
 
         const result = await fetch(`${baseUrl}/chat/completions`, {
             method: 'POST',
