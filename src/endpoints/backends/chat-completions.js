@@ -401,7 +401,11 @@ async function sendClaudeRequest(request, response) {
             console.debug('Claude response:', generateResponseJson);
 
             // Wrap it back to OAI format + save the original content
-            const reply = { choices: [{ 'message': { 'content': responseText } }], content: generateResponseJson.content };
+            const reply = {
+                choices: [{ 'message': { 'content': responseText } }],
+                content: generateResponseJson.content,
+                usage: generateResponseJson.usage,
+            };
             return response.send(reply);
         }
     } catch (error) {
@@ -738,7 +742,11 @@ async function sendMakerSuiteRequest(request, response) {
             }
 
             // Wrap it back to OAI format (responseContent includes thought signatures in parts array)
-            const reply = { choices: [{ 'message': { 'content': responseText } }], responseContent };
+            const reply = {
+                choices: [{ 'message': { 'content': responseText } }],
+                responseContent,
+                usageMetadata: generateResponseJson.usageMetadata,
+            };
             return response.send(reply);
         }
     } catch (error) {
@@ -1732,7 +1740,7 @@ async function sendAzureOpenAIRequest(request, response) {
 
 export const router = express.Router();
 
-router.post('/status', async function (request, statusResponse) {
+export async function checkChatCompletionStatus(request, statusResponse) {
     try {
         if (!request.body) return statusResponse.sendStatus(400);
 
@@ -2068,7 +2076,9 @@ router.post('/status', async function (request, statusResponse) {
             statusResponse.end();
         }
     }
-});
+}
+
+router.post('/status', checkChatCompletionStatus);
 
 router.post('/bias', async function (request, response) {
     if (!request.body || !Array.isArray(request.body))
@@ -2154,7 +2164,7 @@ router.post('/bias', async function (request, response) {
     }
 });
 
-router.post('/generate', async function (request, response) {
+export async function generateChatCompletion(request, response) {
     try {
         if (!request.body) return response.status(400).send({ error: true });
 
@@ -2627,7 +2637,9 @@ router.post('/generate', async function (request, response) {
             response.end();
         }
     }
-});
+}
+
+router.post('/generate', generateChatCompletion);
 
 const multimodalModels = express.Router();
 

@@ -514,6 +514,22 @@ export function getChatData(chatFilePath) {
     return chatData;
 }
 
+/**
+ * Reads a chat without hiding filesystem or JSONL errors. Missing and empty
+ * files are still valid new chats.
+ * @param {string} chatFilePath Full chat path
+ * @returns {Array}
+ */
+export function getChatDataStrict(chatFilePath) {
+    if (!fs.existsSync(chatFilePath)) return [];
+    const chatJSON = fs.readFileSync(chatFilePath, 'utf8');
+    if (!chatJSON.trim()) return [];
+    return chatJSON
+        .split('\n')
+        .filter(line => line.trim())
+        .map(line => JSON.parse(line));
+}
+
 router.post('/get', validateAvatarUrlMiddleware, function (request, response) {
     try {
         const dirName = String(request.body.avatar_url).replace('.png', '');
@@ -536,9 +552,12 @@ router.post('/get', validateAvatarUrlMiddleware, function (request, response) {
         const chatFileName = `${String(request.body.file_name)}.jsonl`;
         const chatFilePath = path.join(directoryPath, sanitize(chatFileName));
 
-        return response.send(getChatData(chatFilePath));
+        return response.send(request.body.strict ? getChatDataStrict(chatFilePath) : getChatData(chatFilePath));
     } catch (error) {
         console.error(error);
+        if (request.body.strict) {
+            return response.status(500).send({ error: 'Unable to read the requested chat safely.' });
+        }
         return response.send({});
     }
 });

@@ -71,6 +71,7 @@ export const SECRET_KEYS = {
     VOLCENGINE_ACCESS_KEY: 'volcengine_access_key',
     WORKERS_AI: 'api_key_workers_ai',
     MIMO: 'api_key_mimo',
+    AIBAR_TELEGRAM_ADMIN: 'aibar_telegram_admin_token',
 };
 
 /**

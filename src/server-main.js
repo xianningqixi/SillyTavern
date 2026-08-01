@@ -65,8 +65,11 @@ import {
 } from './util.js';
 import { UPLOADS_DIRECTORY } from './constants.js';
 
+const AIBAR_USER_ACCOUNTS_ENABLED = getConfigValue('enableUserAccounts', false, 'boolean');
+
 // Routers
 import { router as usersPublicRouter } from './endpoints/users-public.js';
+import { router as aibarPublicRouter } from './endpoints/aibar-public.js';
 import { init as statsInit, onExit as statsOnExit } from './endpoints/stats.js';
 import { checkForNewContent } from './endpoints/content-manager.js';
 import { init as settingsInit } from './endpoints/settings.js';
@@ -243,6 +246,14 @@ app.use(express.static(path.join(serverDirectory, 'public'), {}));
 
 // Public API
 app.use('/api/users', usersPublicRouter);
+if (AIBAR_USER_ACCOUNTS_ENABLED) {
+    app.use('/api/aibar/public', aibarPublicRouter);
+} else {
+    console.error('AIBAR public API disabled: enableUserAccounts must be true.');
+    app.use('/api/aibar/public', (_request, response) => response.status(503).json({
+        error: 'AIBAR requires enableUserAccounts: true',
+    }));
+}
 
 // Everything below this line requires authentication
 app.use(requireLoginMiddleware);
@@ -275,7 +286,7 @@ app.get('/version', async function (_, response) {
 });
 
 redirectDeprecatedEndpoints(app);
-setupPrivateEndpoints(app);
+setupPrivateEndpoints(app, cliArgs);
 
 /**
  * Tasks that need to be run before the server starts listening.
