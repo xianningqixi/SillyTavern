@@ -10,7 +10,7 @@ export const router = express.Router();
 
 const DISCORD_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
 const DISCORD_ATTACHMENT_PATH = /^\/attachments\/\d{17,20}\/\d{17,20}\/[^/]+\.(?:png|json|ya?ml|charx|byaf)$/i;
-const DISCORD_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+const DISCORD_ATTACHMENT_MAX_BYTES = 64 * 1024 * 1024;
 const DISCORD_ATTACHMENT_TIMEOUT_MS = 15_000;
 const DISCORD_ATTACHMENT_MAX_REDIRECTS = 3;
 const SAVED_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
@@ -94,7 +94,7 @@ async function fetchDiscordAttachment(value) {
         const declaredSize = Number(upstream.headers.get('content-length') || 0);
         if (Number.isFinite(declaredSize) && declaredSize > DISCORD_ATTACHMENT_MAX_BYTES) {
             await upstream.body?.cancel();
-            throw new DiscordImportFetchError('Discord attachment exceeds the 20 MB limit', 413);
+            throw new DiscordImportFetchError('Discord attachment exceeds the 64 MB limit', 413);
         }
         if (!upstream.body) throw new DiscordImportFetchError('Discord attachment response is empty', 502);
 
@@ -103,7 +103,7 @@ async function fetchDiscordAttachment(value) {
         for await (const chunk of upstream.body) {
             size += chunk.byteLength;
             if (size > DISCORD_ATTACHMENT_MAX_BYTES) {
-                throw new DiscordImportFetchError('Discord attachment exceeds the 20 MB limit', 413);
+                throw new DiscordImportFetchError('Discord attachment exceeds the 64 MB limit', 413);
             }
             chunks.push(Buffer.from(chunk));
         }
