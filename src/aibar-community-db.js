@@ -40,6 +40,47 @@ CREATE TABLE IF NOT EXISTS work_tags (
     PRIMARY KEY (version_id, tag)
 );
 
+CREATE TABLE IF NOT EXISTS discord_import_batches (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    synced_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (guild_id, channel_id, synced_at, requested_by)
+);
+
+CREATE TABLE IF NOT EXISTS discord_import_items (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES discord_import_batches(id) ON DELETE CASCADE,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_author_name TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    resource_kind TEXT NOT NULL DEFAULT 'character-card' CHECK (resource_kind IN ('character-card', 'web-app')),
+    availability TEXT NOT NULL CHECK (availability IN ('ready', 'browser', 'unsupported')),
+    file_name TEXT NOT NULL DEFAULT '',
+    file_sha256 TEXT NOT NULL DEFAULT '',
+    raw_asset_path TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN (
+        'queued', 'downloading', 'validated', 'published', 'duplicate', 'skipped', 'failed'
+    )),
+    error_message TEXT NOT NULL DEFAULT '',
+    work_id TEXT REFERENCES works(id) ON DELETE SET NULL,
+    work_version_id TEXT REFERENCES work_versions(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, card_id)
+);
+
 CREATE TABLE IF NOT EXISTS favorites (
     user_handle TEXT NOT NULL,
     work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
@@ -183,6 +224,11 @@ CREATE INDEX IF NOT EXISTS idx_works_latest ON works(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_works_author ON works(author_handle, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_versions_work ON work_versions(work_id, version_number DESC);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON work_tags(tag, version_id);
+CREATE INDEX IF NOT EXISTS idx_discord_batches_requester ON discord_import_batches(requested_by, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_discord_items_batch ON discord_import_items(batch_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_discord_items_source_hash ON discord_import_items(guild_id, channel_id, thread_id, file_sha256);
+CREATE INDEX IF NOT EXISTS idx_discord_items_hash ON discord_import_items(file_sha256, status);
+CREATE INDEX IF NOT EXISTS idx_discord_items_status ON discord_import_items(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_comments_work ON comments(work_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_launches_work ON launch_events(work_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_registrations_status ON registration_requests(status, created_at ASC);

@@ -2,6 +2,7 @@
 /* eslint-disable playwright/expect-expect, playwright/no-conditional-in-test */
 
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -154,6 +155,9 @@ const saveStory = getRouteHandler(aibarRouter, '/stories/save');
 const listWorks = getRouteHandler(communityRouter, '/works/list');
 const getWork = getRouteHandler(communityRouter, '/works/get');
 const publishWork = getRouteHandler(communityRouter, '/works/publish');
+const registerDiscordBatch = getRouteHandler(communityRouter, '/admin/discord-import/batches');
+const uploadDiscordItem = getRouteHandler(communityRouter, '/admin/discord-import/items/:itemId/upload');
+const publishDiscordItem = getRouteHandler(communityRouter, '/admin/discord-import/items/:itemId/publish');
 const setWorkStatus = getRouteHandler(communityRouter, '/works/status');
 const deleteWork = getRouteHandler(communityRouter, '/works/delete');
 const launchWork = getRouteHandler(communityRouter, '/works/launch');
@@ -213,11 +217,12 @@ async function invokeRoute(
     handler,
     requestBody,
     profile = { handle: 'admin', name: 'Admin', admin: true },
-    { params = {} } = {},
+    { params = {}, file = undefined } = {},
 ) {
     const request = {
         body: requestBody,
         params,
+        file,
         headers: {},
         socket: { remoteAddress: '127.0.0.1' },
         user: {
@@ -250,6 +255,62 @@ async function invokeRoute(
     };
     await handler(request, response, () => {});
     return result;
+}
+
+const DISCORD_TEST_GUILD_ID = '1380075940285124724';
+const DISCORD_TEST_CHANNEL_ID = '1478612237869519021';
+
+function discordManifest({
+    threadId,
+    cardId = threadId,
+    syncedAt,
+    title = 'Discord Test Card',
+}) {
+    return {
+        version: 1,
+        guildId: DISCORD_TEST_GUILD_ID,
+        channelId: DISCORD_TEST_CHANNEL_ID,
+        channelName: 'hot-cards',
+        syncedAt,
+        timezone: 'Asia/Shanghai',
+        period: 'today',
+        sort: 'reactions',
+        cards: [{
+            id: cardId,
+            threadId,
+            title,
+            authorName: 'Discord Author',
+            sourceUrl: `https://discord.com/channels/${DISCORD_TEST_GUILD_ID}/${threadId}`,
+            tags: ['中文', '剧情'],
+            publishedAt: syncedAt,
+            lastActiveAt: syncedAt,
+            reactionCount: 12,
+            replyCount: 3,
+            resource: {
+                availability: 'ready',
+                kind: 'character-card',
+                fileName: 'card.png',
+            },
+        }],
+    };
+}
+
+async function uploadDiscordTestFile(
+    itemId,
+    contents,
+    fileName = 'card.png',
+    profile = { handle: 'admin', name: 'Admin', admin: true },
+) {
+    const uploadPath = path.join(testRoot, `discord-upload-${crypto.randomUUID()}`);
+    fs.writeFileSync(uploadPath, contents);
+    return invokeRoute(uploadDiscordItem, {}, profile, {
+        params: { itemId },
+        file: {
+            path: uploadPath,
+            size: Buffer.byteLength(contents),
+            originalname: fileName,
+        },
+    });
 }
 
 async function suppressExpectedErrors(callback) {
@@ -859,6 +920,118 @@ test('failed approval provisioning rolls back only its claimed account and direc
     `).get(registrationId);
     assert.equal(registration.status, 'pending');
     assert.equal(registration.reviewed_at, null);
+});
+
+test('Discord import batches validate provenance and register idempotently', async () => {
+    const manifest = discordManifest({
+        threadId: '1478612237869519201',
+        syncedAt: '2026-08-03T01:00:00.000Z',
+    });
+    const invalid = await suppressExpectedErrors(() => invokeRoute(registerDiscordBatch, {
+        manifest: { ...manifest, guildId: '1478612237869519299' },
+    }));
+    assert.equal(invalid.status, 400);
+    assert.match(invalid.body.error, /来源/);
+
+    const created = await invokeRoute(registerDiscordBatch, { manifest });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.items.length, 1);
+    assert.equal(created.body.items[0].status, 'queued');
+
+    const repeated = await invokeRoute(registerDiscordBatch, { manifest });
+    assert.equal(repeated.status, 200);
+    assert.equal(repeated.body.id, created.body.id);
+    assert.equal(getCommunityDb().prepare(`
+        SELECT COUNT(*) AS count FROM discord_import_items WHERE batch_id = ?
+    `).get(created.body.id).count, 1);
+});
+
+test('Discord imports store trusted hashes, publish versions, and deduplicate cross-posts', async () => {
+    const firstManifest = discordManifest({
+        threadId: '1478612237869519202',
+        syncedAt: '2026-08-03T02:00:00.000Z',
+        title: 'Discord Imported Work',
+    });
+    const firstBatch = await invokeRoute(registerDiscordBatch, { manifest: firstManifest });
+    const firstItem = firstBatch.body.items[0];
+    const firstBytes = Buffer.from('discord-card-version-one');
+    const firstHash = crypto.createHash('sha256').update(firstBytes).digest('hex');
+    const foreignUpload = await uploadDiscordTestFile(
+        firstItem.id,
+        firstBytes,
+        'card.png',
+        { handle: 'other-admin', name: 'Other Admin', admin: true },
+    );
+    assert.equal(foreignUpload.status, 404);
+    assert.equal(getCommunityDb().prepare(`
+        SELECT status FROM discord_import_items WHERE id = ?
+    `).get(firstItem.id).status, 'queued');
+
+    const firstUpload = await uploadDiscordTestFile(firstItem.id, firstBytes);
+    assert.equal(firstUpload.status, 200);
+    assert.equal(firstUpload.body.status, 'validated');
+    assert.equal(firstUpload.body.fileSha256, firstHash);
+    const repeatedValidatedBatch = await invokeRoute(registerDiscordBatch, { manifest: firstManifest });
+    assert.equal(repeatedValidatedBatch.body.items[0].status, 'validated');
+    const storedAsset = getCommunityDb().prepare(`
+        SELECT raw_asset_path FROM discord_import_items WHERE id = ?
+    `).get(firstItem.id).raw_asset_path;
+    assert.equal(fs.readFileSync(path.join(testRoot, '_aibar', storedAsset)).toString(), firstBytes.toString());
+
+    const firstPublish = await invokeRoute(publishDiscordItem, { sourceId: characterAvatar }, undefined, {
+        params: { itemId: firstItem.id },
+    });
+    assert.equal(firstPublish.status, 201);
+    assert.equal(firstPublish.body.item.status, 'published');
+    assert.equal(firstPublish.body.work.versionNumber, 1);
+    const firstWorkId = firstPublish.body.work.id;
+    const firstVersionId = firstPublish.body.item.workVersionId;
+    const firstSnapshot = JSON.parse(getCommunityDb().prepare(`
+        SELECT payload_json FROM work_versions WHERE id = ?
+    `).get(firstVersionId).payload_json);
+    assert.equal(firstSnapshot.externalSource.provider, 'discord');
+    assert.equal(firstSnapshot.externalSource.fileSha256, firstHash);
+    assert.equal(firstSnapshot.externalSource.threadId, firstManifest.cards[0].threadId);
+    const repeatedPublish = await invokeRoute(publishDiscordItem, { sourceId: characterAvatar }, undefined, {
+        params: { itemId: firstItem.id },
+    });
+    assert.equal(repeatedPublish.status, 200);
+    assert.equal(repeatedPublish.body.work.id, firstWorkId);
+    assert.equal(getCommunityDb().prepare(`
+        SELECT COUNT(*) AS count FROM work_versions WHERE work_id = ?
+    `).get(firstWorkId).count, 1);
+
+    const updateManifest = discordManifest({
+        threadId: firstManifest.cards[0].threadId,
+        syncedAt: '2026-08-03T03:00:00.000Z',
+        title: 'Discord Imported Work v2',
+    });
+    const updateBatch = await invokeRoute(registerDiscordBatch, { manifest: updateManifest });
+    const updateItem = updateBatch.body.items[0];
+    await uploadDiscordTestFile(updateItem.id, Buffer.from('discord-card-version-two'));
+    const updatedPublish = await invokeRoute(publishDiscordItem, { sourceId: characterAvatar }, undefined, {
+        params: { itemId: updateItem.id },
+    });
+    assert.equal(updatedPublish.status, 200);
+    assert.equal(updatedPublish.body.work.id, firstWorkId);
+    assert.equal(updatedPublish.body.work.versionNumber, 2);
+
+    const mirrorManifest = discordManifest({
+        threadId: '1478612237869519203',
+        syncedAt: '2026-08-03T04:00:00.000Z',
+        title: 'Mirrored Discord Work',
+    });
+    const mirrorBatch = await invokeRoute(registerDiscordBatch, { manifest: mirrorManifest });
+    const mirrorItem = mirrorBatch.body.items[0];
+    await uploadDiscordTestFile(mirrorItem.id, firstBytes);
+    const duplicatePublish = await invokeRoute(publishDiscordItem, { sourceId: characterAvatar }, undefined, {
+        params: { itemId: mirrorItem.id },
+    });
+    assert.equal(duplicatePublish.status, 200);
+    assert.equal(duplicatePublish.body.item.status, 'duplicate');
+    assert.equal(duplicatePublish.body.item.workId, firstWorkId);
+    assert.equal(duplicatePublish.body.item.workVersionId, firstVersionId);
+    assert.equal(getCommunityDb().prepare('SELECT COUNT(*) AS count FROM works WHERE id = ?').get(firstWorkId).count, 1);
 });
 
 test('story publication rejects missing and invalid MOD snapshots', async () => {

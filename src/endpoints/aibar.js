@@ -26,7 +26,7 @@ const STORY_REFERENCE_MAX_LENGTH = 200;
 // A data URL cover cannot be larger than the saved image budget: base64 overhead + a short "data:...;base64," prefix.
 const STORY_COVER_IMAGE_MAX_LENGTH = Math.ceil(SAVED_IMAGE_MAX_BYTES / 3) * 4 + 64;
 
-class DiscordImportFetchError extends Error {
+export class DiscordImportFetchError extends Error {
     constructor(message, status = 400) {
         super(message);
         this.status = status;
@@ -40,7 +40,7 @@ class AibarImageError extends Error {
     }
 }
 
-function validateDiscordAttachmentUrl(value) {
+export function validateDiscordAttachmentUrl(value) {
     let url;
     try {
         url = new URL(String(value || '').trim());
@@ -61,7 +61,7 @@ function validateDiscordAttachmentUrl(value) {
     return url;
 }
 
-async function fetchDiscordAttachment(value) {
+export async function fetchDiscordAttachment(value) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DISCORD_ATTACHMENT_TIMEOUT_MS);
 
