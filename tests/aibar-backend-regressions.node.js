@@ -43,6 +43,7 @@ const [
     { router: aibarRouter },
     { getChatDataStrict },
     { isCsrfProtectionDisabled, setupPrivateEndpoints },
+    { getClaudeApiConfig },
 ] = await Promise.all([
     import('../src/aibar-community-db.js'),
     import('../src/endpoints/aibar-models.js'),
@@ -51,6 +52,7 @@ const [
     import('../src/endpoints/aibar.js'),
     import('../src/endpoints/chats.js'),
     import('../src/server-startup.js'),
+    import('../src/endpoints/backends/chat-completions.js'),
 ]);
 
 const {
@@ -615,6 +617,17 @@ test('shared model source validation rejects providers needing unsupported persi
     });
     assert.equal(accepted.status, 200);
 
+    const acceptedClaude = await invokeRoute(saveModel, {
+        id: 'accepted-claude',
+        name: 'Accepted Anthropic',
+        source: 'claude',
+        model: 'claude-sonnet-4-5',
+        endpoint: 'https://anthropic-compatible.example/v1',
+    });
+    assert.equal(acceptedClaude.status, 200);
+    assert.equal(acceptedClaude.body.source, 'claude');
+    assert.equal(acceptedClaude.body.endpoint, 'https://anthropic-compatible.example/v1');
+
     for (const source of ['azure_openai', 'vertexai', 'workers_ai', 'cometapi', 'unknown-provider']) {
         const result = await invokeRoute(saveModel, {
             id: `blocked-${source}`,
@@ -624,6 +637,19 @@ test('shared model source validation rejects providers needing unsupported persi
         });
         assert.equal(result.status, 400, source);
     }
+});
+
+test('Claude requests use the native Anthropic endpoint and authentication contract', () => {
+    const config = getClaudeApiConfig({
+        reverse_proxy: 'https://anthropic-compatible.example/v1/',
+        proxy_password: 'anthropic-test-key',
+    }, directories);
+    assert.deepEqual(config, {
+        apiUrl: 'https://anthropic-compatible.example/v1',
+        apiKey: 'anthropic-test-key',
+        apiKeyHeader: 'x-api-key',
+        headers: { 'anthropic-version': '2023-06-01' },
+    });
 });
 
 test('editing a shared model preserves its credential owner', async () => {

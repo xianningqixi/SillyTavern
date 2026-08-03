@@ -206,13 +206,27 @@ function setJsonObjectFormat(bodyParams, messages, jsonSchema) {
 }
 
 /**
+ * Resolves the native Anthropic endpoint and authentication contract.
+ * @param {object} body Request body
+ * @param {import('../../users.js').UserDirectoryList} directories User directories
+ * @returns {{apiUrl: string, apiKey: string, apiKeyHeader: string, headers: Record<string, string>}}
+ */
+export function getClaudeApiConfig(body, directories) {
+    return {
+        apiUrl: trimTrailingSlash(new URL(body.reverse_proxy || API_CLAUDE).toString()),
+        apiKey: body.reverse_proxy ? body.proxy_password : readSecret(directories, SECRET_KEYS.CLAUDE, body.secret_id),
+        apiKeyHeader: 'x-api-key',
+        headers: { 'anthropic-version': '2023-06-01' },
+    };
+}
+
+/**
  * Sends a request to Claude API.
  * @param {express.Request} request Express request
  * @param {express.Response} response Express response
  */
 async function sendClaudeRequest(request, response) {
-    const apiUrl = new URL(request.body.reverse_proxy || API_CLAUDE).toString();
-    const apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.CLAUDE, request.body.secret_id);
+    const { apiUrl, apiKey, apiKeyHeader, headers: anthropicHeaders } = getClaudeApiConfig(request.body, request.user.directories);
     const divider = '-'.repeat(process.stdout.columns);
 
     if (!apiKey) {
@@ -379,8 +393,8 @@ async function sendClaudeRequest(request, response) {
             body: JSON.stringify(requestBody),
             headers: {
                 'Content-Type': 'application/json',
-                'anthropic-version': '2023-06-01',
-                'x-api-key': apiKey,
+                ...anthropicHeaders,
+                [apiKeyHeader]: apiKey,
                 ...additionalHeaders,
             },
         });
@@ -1748,11 +1762,14 @@ export async function checkChatCompletionStatus(request, statusResponse) {
         let apiKey = '';
         let headers = {};
         let queryParams = {};
+        let apiKeyHeader = 'Authorization';
 
         if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENAI) {
             apiUrl = new URL(request.body.reverse_proxy || API_OPENAI).toString();
             apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.OPENAI, request.body.secret_id);
             headers = {};
+        } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.CLAUDE) {
+            ({ apiUrl, apiKey, apiKeyHeader, headers } = getClaudeApiConfig(request.body, request.user.directories));
         } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENROUTER) {
             apiUrl = 'https://openrouter.ai/api/v1';
             apiKey = readSecret(request.user.directories, SECRET_KEYS.OPENROUTER, request.body.secret_id);
@@ -1999,7 +2016,7 @@ export async function checkChatCompletionStatus(request, statusResponse) {
         const response = await fetch(modelsUrl, {
             method: 'GET',
             headers: {
-                'Authorization': 'Bearer ' + apiKey,
+                [apiKeyHeader]: apiKeyHeader === 'Authorization' ? 'Bearer ' + apiKey : apiKey,
                 ...headers,
             },
         });
