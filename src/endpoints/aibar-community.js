@@ -19,6 +19,11 @@ import {
     requireAdminMiddleware,
 } from '../users.js';
 import { readCharacterData } from './characters.js';
+import { generateThumbnail } from './thumbnails.js';
+import {
+    ensureCommunityCoverPreview,
+    removeCommunityCoverPreviews,
+} from '../aibar-community-previews.js';
 import {
     DiscordImportFetchError,
     fetchDiscordAttachment,
@@ -28,6 +33,7 @@ import {
 export const router = express.Router();
 
 const MAX_PAGE_SIZE = 48;
+const IMMUTABLE_COVER_CACHE_CONTROL = 'private, max-age=31536000, immutable';
 const MAX_TAGS = 8;
 const MAX_MOD_SNAPSHOT_BYTES = 64 * 1024;
 const MOD_POSITIONS = new Set(['system_prepend', 'system_append', 'user_suffix']);
@@ -1257,6 +1263,14 @@ async function publishCommunitySource(request, input, options = {}) {
         })();
         published = true;
 
+        if (sourceType !== 'mod') {
+            try {
+                await ensureCommunityCoverPreview({ workId, versionId, coverPath: relativeCover });
+            } catch (error) {
+                console.warn(`AIBAR cover preview generation deferred for version ${versionId}:`, error);
+            }
+        }
+
         const row = getWorkRow(workId);
         return {
             created: !existing,
@@ -1390,11 +1404,11 @@ router.post('/admin/discord-import/items/:itemId/publish', requireAdminMiddlewar
     }
 });
 
-router.get('/works/version/:versionId/:kind', (request, response) => {
+router.get('/works/version/:versionId/:kind', async (request, response) => {
     try {
         const kind = request.params.kind === 'asset' ? 'asset_path' : 'cover_path';
         const version = getCommunityDb().prepare(`
-            SELECT v.${kind} AS file_path, w.status, w.author_handle
+            SELECT v.${kind} AS file_path, v.work_id, w.type, w.status, w.author_handle
             FROM work_versions v
             JOIN works w ON w.id = v.work_id
             WHERE v.id = ?
@@ -1405,6 +1419,21 @@ router.get('/works/version/:versionId/:kind', (request, response) => {
             && !request.user.profile.admin
             && version.author_handle !== request.user.profile.handle
         ) return response.sendStatus(404);
+
+        if (kind === 'cover_path' && version.type !== 'mod') {
+            try {
+                const preview = await ensureCommunityCoverPreview({
+                    workId: version.work_id,
+                    versionId: request.params.versionId,
+                    coverPath: version.file_path,
+                });
+                response.setHeader('Cache-Control', IMMUTABLE_COVER_CACHE_CONTROL);
+                return response.sendFile(preview.path);
+            } catch (error) {
+                console.warn(`AIBAR cover preview fallback for version ${request.params.versionId}:`, error);
+                response.setHeader('Cache-Control', IMMUTABLE_COVER_CACHE_CONTROL);
+            }
+        }
         return response.sendFile(resolveCommunityAsset(version.file_path));
     } catch (error) {
         console.error('AIBAR asset read failed:', error);
@@ -1445,6 +1474,11 @@ router.post('/works/delete', (request, response) => {
             removeWorkAssets(id);
         } catch (cleanupError) {
             console.error('AIBAR deleted work asset cleanup failed:', cleanupError);
+        }
+        try {
+            removeCommunityCoverPreviews(id);
+        } catch (cleanupError) {
+            console.error('AIBAR deleted work preview cleanup failed:', cleanupError);
         }
         return response.sendStatus(204);
     } catch (error) {
@@ -1534,7 +1568,7 @@ router.post('/works/comments/delete', (request, response) => {
     }
 });
 
-router.post('/works/launch', (request, response) => {
+router.post('/works/launch', async (request, response) => {
     const journal = createRollbackJournal();
     try {
         const db = getCommunityDb();
@@ -1574,6 +1608,12 @@ router.post('/works/launch', (request, response) => {
         const characterPath = path.join(request.user.directories.characters, avatar);
         journal.captureFile(characterPath);
         fs.copyFileSync(resolveCommunityAsset(version.asset_path), characterPath);
+        if (request.user.directories.thumbnailsAvatar) {
+            const thumbnailPath = path.join(request.user.directories.thumbnailsAvatar, avatar);
+            journal.captureFile(thumbnailPath);
+            const thumbnail = await generateThumbnail(request.user.directories, 'avatar', avatar);
+            if (!thumbnail.path) console.warn(`AIBAR failed to pre-generate private avatar thumbnail for ${avatar}`);
+        }
         const chatDirectory = path.join(request.user.directories.chats, characterBase);
         journal.captureDirectory(chatDirectory);
         fs.mkdirSync(chatDirectory, { recursive: true });

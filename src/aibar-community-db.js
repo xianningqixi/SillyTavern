@@ -399,7 +399,7 @@ function clearReviewedRegistrationCredentials(db) {
 
 export function getCommunityRoot() {
     const dataRoot = globalThis.DATA_ROOT || path.resolve(process.cwd(), 'data');
-    const root = path.join(dataRoot, '_aibar');
+    const root = path.resolve(dataRoot, '_aibar');
     fs.mkdirSync(root, { recursive: true });
     return root;
 }

@@ -9,8 +9,10 @@ import path from 'node:path';
 import { after, test } from 'node:test';
 
 import Database from 'better-sqlite3';
+import { imageSize as sizeOf } from 'image-size';
 import storage from 'node-persist';
 
+import '../src/fetch-patch.js';
 import { setConfigFilePath } from '../src/util.js';
 
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aibar-backend-regressions-'));
@@ -19,6 +21,7 @@ const directories = {
     root: userRoot,
     characters: path.join(userRoot, 'characters'),
     chats: path.join(userRoot, 'chats'),
+    thumbnailsAvatar: path.join(userRoot, 'thumbnails', 'avatar'),
     worlds: path.join(userRoot, 'worlds'),
 };
 
@@ -26,6 +29,7 @@ for (const directory of [
     directories.root,
     directories.characters,
     directories.chats,
+    directories.thumbnailsAvatar,
     directories.worlds,
     path.join(userRoot, 'aibar', 'stories'),
 ]) {
@@ -37,7 +41,8 @@ setConfigFilePath(path.resolve('default/config.yaml'));
 await storage.init({ dir: path.join(testRoot, '_storage'), ttl: false, expiredInterval: 0 });
 
 const [
-    { createCommunityDatabase, getCommunityDb, hashInviteCode },
+    { createCommunityDatabase, getCommunityDb, getCommunityRoot, hashInviteCode },
+    { communityCoverPreviewPath },
     modelsModule,
     publicModule,
     { router: communityRouter },
@@ -47,6 +52,7 @@ const [
     { getClaudeApiConfig },
 ] = await Promise.all([
     import('../src/aibar-community-db.js'),
+    import('../src/aibar-community-previews.js'),
     import('../src/endpoints/aibar-models.js'),
     import('../src/endpoints/aibar-public.js'),
     import('../src/endpoints/aibar-community.js'),
@@ -55,6 +61,10 @@ const [
     import('../src/server-startup.js'),
     import('../src/endpoints/backends/chat-completions.js'),
 ]);
+
+globalThis.DATA_ROOT = path.relative(process.cwd(), testRoot);
+assert.equal(getCommunityRoot(), path.join(testRoot, '_aibar'));
+globalThis.DATA_ROOT = testRoot;
 
 const {
     determineSettlementCharge,
@@ -233,7 +243,7 @@ async function invokeRoute(
             directories,
         },
     };
-    const result = { status: 200, body: null };
+    const result = { status: 200, body: null, headers: {} };
     const response = {
         status(value) {
             result.status = value;
@@ -249,6 +259,10 @@ async function invokeRoute(
         },
         sendFile(value) {
             result.body = value;
+            return this;
+        },
+        setHeader(name, value) {
+            result.headers[String(name).toLowerCase()] = String(value);
             return this;
         },
         sendStatus(value) {
@@ -1228,6 +1242,42 @@ test('story publication rejects missing and invalid MOD snapshots', async () => 
     }
 });
 
+test('community character publication creates and serves an immutable WebP preview', async () => {
+    const published = await invokeRoute(publishWork, {
+        sourceType: 'character',
+        sourceId: characterAvatar,
+        title: 'Preview Character',
+    });
+    assert.equal(published.status, 201);
+
+    const previewPath = communityCoverPreviewPath(published.body.id, published.body.latestVersionId);
+    assert.equal(fs.existsSync(previewPath), true);
+    const preview = fs.readFileSync(previewPath);
+    const original = fs.readFileSync(path.join(directories.characters, characterAvatar));
+    const dimensions = sizeOf(preview);
+    assert.equal(preview.subarray(0, 4).toString('ascii'), 'RIFF');
+    assert.equal(preview.subarray(8, 12).toString('ascii'), 'WEBP');
+    assert.deepEqual({ width: dimensions.width, height: dimensions.height }, { width: 384, height: 512 });
+    assert.ok(preview.length < original.length);
+
+    const asset = await invokeRoute(getWorkVersion, {}, undefined, {
+        params: { versionId: published.body.latestVersionId, kind: 'asset' },
+    });
+    assert.match(asset.body, /character\.png$/);
+
+    fs.unlinkSync(previewPath);
+    const cover = await invokeRoute(getWorkVersion, {}, undefined, {
+        params: { versionId: published.body.latestVersionId, kind: 'cover' },
+    });
+    assert.equal(cover.status, 200);
+    assert.equal(cover.body, previewPath);
+    assert.equal(cover.headers['cache-control'], 'private, max-age=31536000, immutable');
+    assert.equal(fs.existsSync(previewPath), true);
+
+    assert.equal((await invokeRoute(deleteWork, { id: published.body.id })).status, 204);
+    assert.equal(fs.existsSync(previewPath), false);
+});
+
 test('hidden community works enforce author and administrator governance', async () => {
     const author = { handle: 'community-author', name: 'Community Author', admin: false };
     const outsider = { handle: 'community-outsider', name: 'Community Outsider', admin: false };
@@ -1308,6 +1358,7 @@ test('story launch returns the installed MOD snapshots', async () => {
 
     const launched = await invokeRoute(launchWork, { id: published.body.id });
     assert.equal(launched.status, 201);
+    assert.equal(fs.existsSync(path.join(directories.thumbnailsAvatar, launched.body.avatar)), true);
     assert.deepEqual(launched.body.story.modIds, ['valid-mod']);
     assert.equal(launched.body.installedMods.length, 1);
     assert.deepEqual(launched.body.installedMods[0], settings.aibar.simple_ui_mods[0]);

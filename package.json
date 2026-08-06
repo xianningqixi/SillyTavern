@@ -127,6 +127,7 @@
         "start:bun": "bun server.js",
         "start:no-csrf": "node server.js --disableCsrf",
         "test:aibar": "node --test --test-force-exit tests/aibar-backend-regressions.node.js",
+        "backfill:aibar-previews": "node src/aibar-community-previews-cli.js",
         "lint": "eslint \"src/**/*.js\" \"public/**/*.js\" ./*.js",
         "lint:fix": "eslint \"src/**/*.js\" \"public/**/*.js\" ./*.js --fix",
         "plugins:update": "node plugins update",

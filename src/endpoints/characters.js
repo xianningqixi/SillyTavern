@@ -18,7 +18,7 @@ import { deepMerge, humanizedDateTime, tryParse, MemoryLimitedMap, getConfigValu
 import { TavernCardValidator } from '../validator/TavernCardValidator.js';
 import { parse, read, write } from '../character-card-parser.js';
 import { readWorldInfoFile } from './worldinfo.js';
-import { invalidateThumbnail } from './thumbnails.js';
+import { generateThumbnail, invalidateThumbnail } from './thumbnails.js';
 import { importRisuSprites } from './sprites.js';
 import { getUserDirectories } from '../users.js';
 import { getChatInfo } from './chats.js';
@@ -1036,12 +1036,14 @@ router.post('/create', getFileNameValidationFunction('file_name'), async functio
 
         if (!request.file) {
             await writeCharacterData(DEFAULT_AVATAR_PATH, char, internalName, request);
+            await ensureAvatarThumbnail(request.user.directories, avatarName);
             return response.send(avatarName);
         } else {
             const crop = tryParse(request.query.crop);
             const uploadPath = path.join(request.file.destination, request.file.filename);
             await writeCharacterData(uploadPath, char, internalName, request, crop);
             fs.unlinkSync(uploadPath);
+            await ensureAvatarThumbnail(request.user.directories, avatarName);
             return response.send(avatarName);
         }
     } catch (err) {
@@ -1544,6 +1546,12 @@ function getPngName(file, directories) {
         { nameBuilder: (base, i) => i === 0 ? base : `${base}${i}`, startIndex: 0, maxTries: 10000 }) ?? file;
 }
 
+async function ensureAvatarThumbnail(directories, avatarName) {
+    if (!directories?.characters || !directories?.thumbnailsAvatar) return;
+    const result = await generateThumbnail(directories, 'avatar', avatarName);
+    if (!result.path) console.warn(`Failed to pre-generate avatar thumbnail for ${avatarName}`);
+}
+
 /**
  * Gets the preserved name for the uploaded file if the request is valid.
  * @param {import("express").Request} request - Express request object
@@ -1589,6 +1597,8 @@ router.post('/import', async function (request, response) {
             invalidateThumbnail(request.user.directories, 'avatar', `${preservedFileName}.png`);
         }
 
+        await ensureAvatarThumbnail(request.user.directories, `${fileName}.png`);
+
         response.send({ file_name: fileName });
     } catch (err) {
         console.error(err);
@@ -1633,6 +1643,7 @@ router.post('/duplicate', validateAvatarUrlMiddleware, async function (request, 
         }
 
         fs.copyFileSync(filename, newFilename);
+        await ensureAvatarThumbnail(request.user.directories, path.parse(newFilename).base);
         console.info(`${filename} was copied to ${newFilename}`);
         response.send({ path: path.parse(newFilename).base });
     } catch (error) {
