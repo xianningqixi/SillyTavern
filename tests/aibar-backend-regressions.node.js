@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
+import Database from 'better-sqlite3';
 import storage from 'node-persist';
 
 import { setConfigFilePath } from '../src/util.js';
@@ -267,6 +268,8 @@ function discordManifest({
     cardId = threadId,
     syncedAt,
     title = 'Discord Test Card',
+    period = 'today',
+    filters,
 }) {
     return {
         version: 1,
@@ -275,8 +278,9 @@ function discordManifest({
         channelName: 'hot-cards',
         syncedAt,
         timezone: 'Asia/Shanghai',
-        period: 'today',
+        period,
         sort: 'reactions',
+        ...(filters ? { filters } : {}),
         cards: [{
             id: cardId,
             threadId,
@@ -766,7 +770,26 @@ test('registration rate limiting can distinguish clients behind a reverse proxy'
     assert.equal(registrationRateLimitKey(request, true), '127.0.0.1 (forwarded: 203.0.113.42)');
 });
 
-test('concurrent registration submissions create only one pending handle', async () => {
+test('registration without an invite creates a pending review request', async () => {
+    const body = {
+        inviteCode: '',
+        handle: 'review-registration-user',
+        name: 'Review Registration',
+        password: 'password-123',
+    };
+    const result = await invokeRoute(registerUser, body);
+    assert.equal(result.status, 202);
+    assert.equal(result.body.status, 'pending');
+
+    const db = getCommunityDb();
+    assert.equal(db.prepare(`
+        SELECT invite_id FROM registration_requests WHERE id = ?
+    `).get(result.body.id).invite_id, null);
+    assert.equal(await storage.getItem(`user:${body.handle}`), undefined);
+    assert.equal(db.prepare('SELECT 1 FROM point_accounts WHERE user_handle = ?').get(body.handle), undefined);
+});
+
+test('concurrent invite registrations create one approved account with initial points', async () => {
     const inviteId = 'registration-race-invite';
     const inviteCode = 'REGISTRATION-RACE';
     insertInvite(inviteId, inviteCode, 2);
@@ -781,14 +804,28 @@ test('concurrent registration submissions create only one pending handle', async
         invokeRoute(registerUser, body),
         invokeRoute(registerUser, body),
     ]);
-    assert.deepEqual(results.map(result => result.status).sort(), [202, 409]);
+    assert.deepEqual(results.map(result => result.status).sort(), [201, 409]);
 
     const db = getCommunityDb();
     assert.equal(db.prepare(`
         SELECT COUNT(*) AS count FROM registration_requests
-        WHERE handle = ? AND status = 'pending'
+        WHERE handle = ? AND status = 'approved'
     `).get(body.handle).count, 1);
     assert.equal(db.prepare('SELECT use_count FROM invites WHERE id = ?').get(inviteId).use_count, 1);
+    assert.equal((await storage.getItem(`user:${body.handle}`)).handle, body.handle);
+    assert.deepEqual(
+        db.prepare(`
+            SELECT balance_micros, held_micros FROM point_accounts WHERE user_handle = ?
+        `).get(body.handle),
+        { balance_micros: 10_000_000_000, held_micros: 0 },
+    );
+    assert.deepEqual(
+        db.prepare(`
+            SELECT delta_micros, balance_after_micros, kind
+            FROM point_ledger WHERE user_handle = ?
+        `).get(body.handle),
+        { delta_micros: 10_000_000_000, balance_after_micros: 10_000_000_000, kind: 'signup_bonus' },
+    );
 });
 
 test('concurrent approval of one request cannot delete the winning account', async () => {
@@ -807,6 +844,17 @@ test('concurrent approval of one request cannot delete the winning account', asy
     const account = await storage.getItem(`user:${handle}`);
     assert.equal(account.handle, handle);
     assert.equal(account._aibarApprovalClaim, undefined);
+    assert.equal(
+        getCommunityDb().prepare('SELECT balance_micros FROM point_accounts WHERE user_handle = ?').get(handle).balance_micros,
+        10_000_000_000,
+    );
+    assert.equal(
+        getCommunityDb().prepare(`
+            SELECT COUNT(*) AS count FROM point_ledger
+            WHERE user_handle = ? AND kind = 'signup_bonus'
+        `).get(handle).count,
+        1,
+    );
     assert.deepEqual(
         getCommunityDb().prepare(`
             SELECT status, password_hash, password_salt
@@ -846,6 +894,73 @@ test('the database rejects duplicate active registration handles', () => {
         () => insertRegistration('duplicate-handle-b', handle, inviteId),
         error => String(error.code || '').startsWith('SQLITE_CONSTRAINT'),
     );
+});
+
+test('registration requests allow review-based submissions without invites', () => {
+    const db = getCommunityDb();
+    const id = 'registration-without-invite';
+    db.prepare(`
+        INSERT INTO registration_requests (
+            id, handle, name, password_hash, password_salt, invite_id, created_at
+        ) VALUES (?, 'registration-without-invite', 'No Invite', 'hash', 'salt', NULL, ?)
+    `).run(id, new Date().toISOString());
+    assert.equal(db.prepare('SELECT invite_id FROM registration_requests WHERE id = ?').get(id).invite_id, null);
+});
+
+test('database migration makes legacy registration invite references optional', () => {
+    const databasePath = path.join(testRoot, 'legacy-required-invites.sqlite');
+    let db = new Database(databasePath);
+    db.exec(`
+        CREATE TABLE invites (
+            id TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL UNIQUE,
+            label TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE registration_requests (
+            id TEXT PRIMARY KEY,
+            handle TEXT NOT NULL,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            invite_id TEXT NOT NULL REFERENCES invites(id),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+            review_note TEXT NOT NULL DEFAULT '',
+            reviewed_by TEXT,
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
+        );
+        INSERT INTO invites (id, code_hash, created_by, created_at)
+        VALUES ('legacy-required-invite', 'legacy-required-hash', 'admin', '2026-01-01T00:00:00.000Z');
+        INSERT INTO registration_requests (
+            id, handle, name, password_hash, password_salt, invite_id, created_at
+        ) VALUES (
+            'legacy-required-registration', 'legacy-required-registration', 'Legacy',
+            'hash', 'salt', 'legacy-required-invite', '2026-01-01T00:00:00.000Z'
+        );
+    `);
+    db.close();
+
+    db = createCommunityDatabase(databasePath);
+    try {
+        assert.equal(
+            db.prepare('SELECT invite_id FROM registration_requests WHERE id = ?')
+                .get('legacy-required-registration').invite_id,
+            'legacy-required-invite',
+        );
+        db.prepare(`
+            INSERT INTO registration_requests (
+                id, handle, name, password_hash, password_salt, invite_id, created_at
+            ) VALUES ('legacy-review-registration', 'legacy-review-registration', 'Review', 'hash', 'salt', NULL, ?)
+        `).run(new Date().toISOString());
+    } finally {
+        db.close();
+    }
 });
 
 test('database migration closes historical duplicate active registrations', () => {
@@ -946,12 +1061,45 @@ test('failed approval provisioning rolls back only its claimed account and direc
     `).get(registrationId);
     assert.equal(registration.status, 'pending');
     assert.equal(registration.reviewed_at, null);
+    assert.equal(getCommunityDb().prepare('SELECT 1 FROM point_accounts WHERE user_handle = ?').get(handle), undefined);
+});
+
+test('failed invite registration returns its invite use and leaves no account or points', async () => {
+    const inviteId = 'failed-invite-registration-invite';
+    const inviteCode = 'FAILED-INVITE-REGISTRATION';
+    const handle = 'failed-invite-registration-user';
+    const accountRoot = path.join(testRoot, handle);
+    const expectedSettingsPath = path.join(accountRoot, 'settings.json');
+    insertInvite(inviteId, inviteCode, 1);
+
+    const originalExistsSync = fs.existsSync;
+    fs.existsSync = target => target === expectedSettingsPath ? false : originalExistsSync(target);
+    let result;
+    try {
+        result = await suppressExpectedErrors(() => invokeRoute(registerUser, {
+            inviteCode,
+            handle,
+            name: 'Failed Invite Registration',
+            password: 'password-123',
+        }));
+    } finally {
+        fs.existsSync = originalExistsSync;
+    }
+
+    assert.equal(result.status, 500);
+    assert.equal(await storage.getItem(`user:${handle}`), undefined);
+    assert.equal(fs.existsSync(accountRoot), false);
+    assert.equal(getCommunityDb().prepare('SELECT use_count FROM invites WHERE id = ?').get(inviteId).use_count, 0);
+    assert.equal(getCommunityDb().prepare('SELECT 1 FROM registration_requests WHERE handle = ?').get(handle), undefined);
+    assert.equal(getCommunityDb().prepare('SELECT 1 FROM point_accounts WHERE user_handle = ?').get(handle), undefined);
 });
 
 test('Discord import batches validate provenance and register idempotently', async () => {
     const manifest = discordManifest({
         threadId: '1478612237869519201',
         syncedAt: '2026-08-03T01:00:00.000Z',
+        period: 'previous-day',
+        filters: { tags: ['中文', '剧情'], tagMatch: 'all' },
     });
     const invalid = await suppressExpectedErrors(() => invokeRoute(registerDiscordBatch, {
         manifest: { ...manifest, guildId: '1478612237869519299' },
@@ -963,6 +1111,14 @@ test('Discord import batches validate provenance and register idempotently', asy
     assert.equal(created.status, 201);
     assert.equal(created.body.items.length, 1);
     assert.equal(created.body.items[0].status, 'queued');
+    assert.equal(created.body.manifest.period, 'previous-day');
+    assert.deepEqual(created.body.manifest.filters, { tags: ['中文', '剧情'], tagMatch: 'all' });
+
+    const mismatchedFilters = await suppressExpectedErrors(() => invokeRoute(registerDiscordBatch, {
+        manifest: { ...manifest, syncedAt: '2026-08-03T01:01:00.000Z', filters: { tags: ['原创'], tagMatch: 'any' } },
+    }));
+    assert.equal(mismatchedFilters.status, 400);
+    assert.match(mismatchedFilters.body.error, /筛选条件/);
 
     const repeated = await invokeRoute(registerDiscordBatch, { manifest });
     assert.equal(repeated.status, 200);

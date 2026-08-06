@@ -9,14 +9,15 @@ import { sync as writeFileSyncAtomic } from 'write-file-atomic';
 
 import { getCommunityDb, getCommunityRoot, hashInviteCode } from '../aibar-community-db.js';
 import {
+    finalizeRegistrationAccount,
+    grantInitialPoints,
+    provisionRegistrationAccount,
+    rollbackRegistrationAccount,
+} from '../aibar-registration.js';
+import {
     KEY_PREFIX,
-    ensurePublicDirectoriesExist,
-    getAllUserHandles,
-    getUserDirectories,
     requireAdminMiddleware,
-    toKey,
 } from '../users.js';
-import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
 import { readCharacterData } from './characters.js';
 import {
     DiscordImportFetchError,
@@ -69,6 +70,14 @@ function discordImportText(value, label, maxLength, { allowEmpty = false } = {})
     return text;
 }
 
+function discordImportTags(value, label, maxItems) {
+    if (!Array.isArray(value) || value.length > maxItems) throw new Error(`${label} 无效`);
+    const tags = value.map((tag, index) => discordImportText(tag, `${label}[${index}]`, 48));
+    const normalized = tags.map(tag => tag.toLocaleLowerCase('en-US'));
+    if (new Set(normalized).size !== tags.length) throw new Error(`${label} 不能重复`);
+    return tags;
+}
+
 function discordSnowflake(value, label) {
     const id = discordImportText(value, label, 20);
     if (!DISCORD_SNOWFLAKE_PATTERN.test(id)) throw new Error(`${label} 不是有效的 Discord ID`);
@@ -116,8 +125,14 @@ function normalizeDiscordImportManifest(value) {
         throw new Error('Discord 清单来源不在允许范围内');
     }
     if (value.timezone !== DISCORD_IMPORT_TIMEZONE) throw new Error('Discord 清单时区无效');
-    if (!['today', 'rolling-24h'].includes(value.period)) throw new Error('Discord 清单周期无效');
+    if (!['today', 'previous-day', 'rolling-24h'].includes(value.period)) throw new Error('Discord 清单周期无效');
     if (!['reactions', 'activity'].includes(value.sort)) throw new Error('Discord 清单排序无效');
+    const rawFilters = value.filters === undefined ? { tags: [], tagMatch: 'any' } : value.filters;
+    if (!rawFilters || typeof rawFilters !== 'object' || Array.isArray(rawFilters)) {
+        throw new Error('Discord 清单筛选条件无效');
+    }
+    const filterTags = discordImportTags(rawFilters.tags, 'Discord 清单筛选标签', 64);
+    if (!['any', 'all'].includes(rawFilters.tagMatch)) throw new Error('Discord 清单标签匹配方式无效');
     const syncedAt = discordImportText(value.syncedAt, 'syncedAt', 40);
     if (!Number.isFinite(Date.parse(syncedAt))) throw new Error('syncedAt 不是有效时间');
     if (!Array.isArray(value.cards) || value.cards.length > DISCORD_IMPORT_MAX_CARDS) {
@@ -138,6 +153,7 @@ function normalizeDiscordImportManifest(value) {
         const availability = ['ready', 'browser', 'unsupported'].includes(resource.availability)
             ? resource.availability
             : 'unsupported';
+        const tags = discordImportTags(raw.tags, `cards[${index}].tags`, 16);
         return {
             cardId,
             threadId,
@@ -147,7 +163,7 @@ function normalizeDiscordImportManifest(value) {
             resourceKind,
             availability,
             metadata: {
-                tags: stringArray(raw.tags),
+                tags,
                 publishedAt: typeof raw.publishedAt === 'string' ? raw.publishedAt.slice(0, 40) : '',
                 lastActiveAt: typeof raw.lastActiveAt === 'string' ? raw.lastActiveAt.slice(0, 40) : '',
                 reactionCount: Math.max(0, Number(raw.reactionCount) || 0),
@@ -156,8 +172,20 @@ function normalizeDiscordImportManifest(value) {
             },
         };
     });
+    const normalizedFilterTags = filterTags.map(tag => tag.toLocaleLowerCase('en-US'));
+    cards.forEach((card, index) => {
+        if (!normalizedFilterTags.length) return;
+        const cardTags = new Set(card.metadata.tags.map(tag => tag.toLocaleLowerCase('en-US')));
+        const matches = rawFilters.tagMatch === 'all'
+            ? normalizedFilterTags.every(tag => cardTags.has(tag))
+            : normalizedFilterTags.some(tag => cardTags.has(tag));
+        if (!matches) throw new Error(`cards[${index}].tags 不符合 Discord 清单筛选条件`);
+    });
     return {
-        manifest: value,
+        manifest: {
+            ...value,
+            filters: { tags: filterTags, tagMatch: rawFilters.tagMatch },
+        },
         cards,
         channelName: discordImportText(value.channelName || '', 'channelName', 120, { allowEmpty: true }),
         syncedAt: new Date(syncedAt).toISOString(),
@@ -1759,36 +1787,13 @@ router.post('/admin/registrations/review', requireAdminMiddleware, async (reques
         if (!claimed) return response.status(409).json({ error: '该账号的注册申请正在由其他管理员处理' });
         approvalClaim = { db, id, token: claimToken };
 
-        const handles = await getAllUserHandles();
-        if (handles.includes(registration.handle) || await storage.getItem(toKey(registration.handle))) {
-            const error = new Error('账号已存在，无法重复批准');
-            error.statusCode = 409;
-            throw error;
-        }
-
-        const user = {
+        provisionedAccount = await provisionRegistrationAccount({
             handle: registration.handle,
             name: registration.name,
-            created: Date.now(),
-            password: registration.password_hash,
-            salt: registration.password_salt,
-            admin: false,
-            enabled: true,
-            _aibarApprovalClaim: claimToken,
-        };
-        const directories = getUserDirectories(user.handle);
-        provisionedAccount = {
-            handle: user.handle,
-            root: directories.root,
-            removeRoot: !fs.existsSync(directories.root),
-            token: claimToken,
-        };
-        await storage.setItem(toKey(user.handle), user);
-        await ensurePublicDirectoriesExist();
-        await checkForNewContent([directories], [CONTENT_TYPES.SETTINGS]);
-        if (!fs.existsSync(path.join(directories.root, 'settings.json'))) {
-            throw new Error('账号初始化失败：未能创建设置文件');
-        }
+            passwordHash: registration.password_hash,
+            passwordSalt: registration.password_salt,
+            claimToken,
+        });
 
         const reviewedAt = nowIso();
         db.transaction(() => {
@@ -1805,15 +1810,12 @@ router.post('/admin/registrations/review', requireAdminMiddleware, async (reques
                     reviewed_by = ?, reviewed_at = ?, password_hash = '', password_salt = ''
                 WHERE handle = ? AND id <> ? AND status = 'pending' AND reviewed_at IS NULL
             `).run(request.user.profile.handle, reviewedAt, registration.handle, id);
+            grantInitialPoints(db, registration.handle, id, reviewedAt);
         })();
         approvalFinalized = true;
 
         try {
-            const stored = await storage.getItem(toKey(user.handle));
-            if (stored?._aibarApprovalClaim === claimToken) {
-                delete stored._aibarApprovalClaim;
-                await storage.setItem(toKey(user.handle), stored);
-            }
+            await finalizeRegistrationAccount(provisionedAccount);
         } catch (cleanupError) {
             console.error('AIBAR registration approval marker cleanup failed:', cleanupError);
         }
@@ -1824,28 +1826,9 @@ router.post('/admin/registrations/review', requireAdminMiddleware, async (reques
     } catch (error) {
         let claimCanBeReleased = true;
         if (provisionedAccount && !approvalFinalized) {
-            let accountRemoved = false;
-            try {
-                const stored = await storage.getItem(toKey(provisionedAccount.handle));
-                if (!stored) {
-                    accountRemoved = true;
-                } else if (stored._aibarApprovalClaim === provisionedAccount.token) {
-                    await storage.removeItem(toKey(provisionedAccount.handle));
-                    accountRemoved = true;
-                } else {
-                    claimCanBeReleased = false;
-                }
-            } catch (rollbackError) {
-                claimCanBeReleased = false;
-                console.error('AIBAR registration account rollback failed:', rollbackError);
-            }
-            if (provisionedAccount.removeRoot && accountRemoved) {
-                try {
-                    await fs.promises.rm(provisionedAccount.root, { recursive: true, force: true });
-                } catch (rollbackError) {
-                    console.error('AIBAR registration directory rollback failed:', rollbackError);
-                }
-            }
+            claimCanBeReleased = await rollbackRegistrationAccount(provisionedAccount);
+        } else if (!provisionedAccount && error.aibarAccountRollbackSucceeded === false) {
+            claimCanBeReleased = false;
         }
         if (approvalClaim && !approvalFinalized && claimCanBeReleased) {
             approvalClaim.db.prepare(`

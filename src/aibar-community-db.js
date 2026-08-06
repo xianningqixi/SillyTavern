@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS registration_requests (
     name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     password_salt TEXT NOT NULL,
-    invite_id TEXT NOT NULL REFERENCES invites(id),
+    invite_id TEXT REFERENCES invites(id),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
     review_note TEXT NOT NULL DEFAULT '',
     reviewed_by TEXT,
@@ -235,6 +235,8 @@ CREATE INDEX IF NOT EXISTS idx_registrations_status ON registration_requests(sta
 CREATE INDEX IF NOT EXISTS idx_shared_models_enabled ON shared_models(enabled, sort_order, created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_codes_created ON credit_codes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_point_ledger_user ON point_ledger(user_handle, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_point_ledger_signup_bonus
+ON point_ledger(user_handle) WHERE kind = 'signup_bonus';
 CREATE INDEX IF NOT EXISTS idx_model_usage_user ON model_usage(user_handle, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_usage_status ON model_usage(status, created_at);
 `;
@@ -288,6 +290,57 @@ function migrateWorksTypeConstraint(db) {
     const violations = db.pragma('foreign_key_check');
     if (violations.length) {
         throw new Error('AIBAR community database migration failed foreign key validation');
+    }
+}
+
+/**
+ * Allows review-based registrations to be submitted without an invite code.
+ * @param {import('better-sqlite3').Database} db Community database
+ */
+function migrateRegistrationInviteConstraint(db) {
+    const table = db.prepare('SELECT sql FROM sqlite_master WHERE type = \'table\' AND name = \'registration_requests\'').get();
+    if (!table?.sql || !/invite_id\s+TEXT\s+NOT\s+NULL/i.test(table.sql)) return;
+
+    const foreignKeysEnabled = !!db.pragma('foreign_keys', { simple: true });
+    db.pragma('foreign_keys = OFF');
+    try {
+        db.exec(`
+            BEGIN IMMEDIATE;
+            CREATE TABLE registration_requests_migration (
+                id TEXT PRIMARY KEY,
+                handle TEXT NOT NULL,
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                invite_id TEXT REFERENCES invites(id),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+                review_note TEXT NOT NULL DEFAULT '',
+                reviewed_by TEXT,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT
+            );
+            INSERT INTO registration_requests_migration (
+                id, handle, name, password_hash, password_salt, invite_id,
+                status, review_note, reviewed_by, created_at, reviewed_at
+            )
+            SELECT
+                id, handle, name, password_hash, password_salt, invite_id,
+                status, review_note, reviewed_by, created_at, reviewed_at
+            FROM registration_requests;
+            DROP TABLE registration_requests;
+            ALTER TABLE registration_requests_migration RENAME TO registration_requests;
+            COMMIT;
+        `);
+    } catch (error) {
+        if (db.inTransaction) db.exec('ROLLBACK');
+        throw error;
+    } finally {
+        db.pragma(`foreign_keys = ${foreignKeysEnabled ? 'ON' : 'OFF'}`);
+    }
+
+    const violations = db.pragma('foreign_key_check');
+    if (violations.length) {
+        throw new Error('AIBAR registration database migration failed foreign key validation');
     }
 }
 
@@ -359,6 +412,7 @@ export function createCommunityDatabase(filePath) {
     db.pragma('busy_timeout = 5000');
     db.exec(schema);
     migrateWorksTypeConstraint(db);
+    migrateRegistrationInviteConstraint(db);
     migrateRegistrationHandleConstraint(db);
     clearReviewedRegistrationCredentials(db);
     // Recreate indexes that belonged to the rebuilt works table.
