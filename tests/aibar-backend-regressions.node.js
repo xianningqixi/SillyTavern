@@ -1758,3 +1758,53 @@ test('PNG character metadata survives zTXt/iTXt chunks, broken CRCs and corrupt 
     // 没有任何角色数据 chunk：保持原错误语义
     assert.throws(() => read(buildPng([])), /No PNG metadata/);
 });
+
+test('discord batch publish orchestration caps fetch concurrency and isolates failures', async () => {
+    const { runDiscordPublishBatch } = await import('../src/endpoints/aibar-community.js');
+
+    const items = Array.from({ length: 7 }, (_, index) => ({ id: `card-${index}` }));
+    let inFlightFetches = 0;
+    let maxInFlightFetches = 0;
+    let publishActive = 0;
+    const publishOrder = [];
+
+    const results = await runDiscordPublishBatch(items, {
+        fetchConcurrency: 3,
+        fetchItem: async (item, index) => {
+            inFlightFetches += 1;
+            maxInFlightFetches = Math.max(maxInFlightFetches, inFlightFetches);
+            await new Promise(resolve => setTimeout(resolve, 12 - index));
+            inFlightFetches -= 1;
+            if (index === 2) throw new Error(`fetch failed for ${item.id}`);
+            return { buffer: Buffer.from(item.id) };
+        },
+        publishItem: async (item, fetched, index) => {
+            publishActive += 1;
+            assert.equal(publishActive, 1, 'imports/publishes must be serialized');
+            await new Promise(resolve => setTimeout(resolve, 2));
+            publishActive -= 1;
+            publishOrder.push(index);
+            if (index === 4) throw new Error(`publish failed for ${item.id}`);
+            return { status: 'published', workId: `work-${fetched.buffer.toString()}` };
+        },
+    });
+
+    assert.equal(results.length, items.length);
+    assert.ok(maxInFlightFetches <= 3, `fetch concurrency must stay <= 3, saw ${maxInFlightFetches}`);
+    assert.equal(results[2].status, 'failed');
+    assert.match(String(results[2].error?.message), /fetch failed/);
+    assert.equal(results[4].status, 'failed');
+    assert.match(String(results[4].error?.message), /publish failed/);
+    for (const index of [0, 1, 3, 5, 6]) {
+        assert.equal(results[index].status, 'published', `item ${index} should publish`);
+        assert.equal(results[index].workId, `work-card-${index}`);
+    }
+    assert.equal(publishOrder.length, 6, 'failed fetch skips publish; failed publish still counts as attempted');
+});
+
+test('the discord batch publish route is admin-gated behind a per-user rate limiter', () => {
+    const layer = communityRouter.stack.find(item => item.route?.path === '/works/publish-discord-batch' && item.route.methods.post);
+    assert.ok(layer, 'batch route must exist');
+    assert.ok(layer.route.stack.length >= 3, 'admin middleware + rate limiter + handler');
+    assert.equal(layer.route.stack[1].handle.name, 'userRateLimit');
+});

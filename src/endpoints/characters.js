@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { promises as fsPromises } from 'node:fs';
@@ -1563,21 +1564,47 @@ function getPreservedName(request) {
         : undefined;
 }
 
+const formatImportFunctions = {
+    'yaml': importFromYaml,
+    'yml': importFromYaml,
+    'json': importFromJson,
+    'png': importFromPng,
+    'charx': importFromCharX,
+    'byaf': importFromByaf,
+};
+
+/**
+ * AIBAR：从内存 buffer 导入角色卡（服务器端 Discord 批量发布用），
+ * 复用 /import 路由的格式分派，不经过 multer/multipart。
+ * @param {Buffer} buffer 卡体文件内容
+ * @param {string} format 文件扩展名（png/json/yaml/yml/charx/byaf）
+ * @param {import('express').Request} request 已认证的请求（提供 user.directories）
+ * @returns {Promise<string>} 导入后的角色文件名（不含 .png 后缀）
+ */
+export async function importCharacterBuffer(buffer, format, request) {
+    const importFunction = formatImportFunctions[String(format || '').toLowerCase()];
+    if (!importFunction) throw new Error(`Unsupported format: ${format}`);
+    const uploadPath = path.join(
+        os.tmpdir(),
+        `aibar-discord-import-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await fsPromises.writeFile(uploadPath, buffer);
+    try {
+        const fileName = await importFunction(uploadPath, { request, response: null }, undefined);
+        if (!fileName) throw new Error('Character import failed');
+        await ensureAvatarThumbnail(request.user.directories, `${fileName}.png`);
+        return fileName;
+    } finally {
+        await fsPromises.rm(uploadPath, { force: true }).catch(() => {});
+    }
+}
+
 router.post('/import', async function (request, response) {
     if (!request.body || !request.file) return response.sendStatus(400);
 
     const uploadPath = path.join(request.file.destination, request.file.filename);
     const format = request.body.file_type;
     const preservedFileName = getPreservedName(request);
-
-    const formatImportFunctions = {
-        'yaml': importFromYaml,
-        'yml': importFromYaml,
-        'json': importFromJson,
-        'png': importFromPng,
-        'charx': importFromCharX,
-        'byaf': importFromByaf,
-    };
 
     try {
         const importFunction = formatImportFunctions[format];

@@ -20,7 +20,7 @@ import {
     KEY_PREFIX,
     requireAdminMiddleware,
 } from '../users.js';
-import { readCharacterData } from './characters.js';
+import { importCharacterBuffer, readCharacterData } from './characters.js';
 import { generateThumbnail } from './thumbnails.js';
 import {
     ensureCommunityCoverPreview,
@@ -1371,79 +1371,186 @@ router.post('/works/publish', publishRateLimiter, async (request, response) => {
     }
 });
 
+/**
+ * Discord 角色卡公开发布的核心逻辑：哈希去重 → 同 thread 版本关联 → 发布。
+ * 单项路由与批量路由共用。
+ * @param {import('express').Request} request 已认证的管理员请求
+ * @param {string} sourceId 私人角色文件名（含 .png）
+ * @param {object} discordSource normalizeDiscordPublicSource 的产物
+ * @returns {Promise<{ status: 'published' | 'duplicate', versionId: string, work: object, created?: boolean }>}
+ */
+async function publishDiscordCharacter(request, sourceId, discordSource) {
+    const source = await capturePrivateSource(request, 'character', sourceId);
+    const fileSha256 = crypto.createHash('sha256').update(fs.readFileSync(source.characterPath)).digest('hex');
+    const db = getCommunityDb();
+
+    const duplicate = db.prepare(`
+        SELECT w.id AS work_id, v.id AS version_id
+        FROM work_versions v
+        JOIN works w ON w.id = v.work_id
+        WHERE w.type = 'character' AND w.status = 'published'
+          AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
+          AND json_extract(v.payload_json, '$.externalSource.fileSha256') = ?
+        ORDER BY v.created_at DESC
+        LIMIT 1
+    `).get(fileSha256);
+    if (duplicate) {
+        const row = getWorkRow(duplicate.work_id);
+        if (!row) throw new CommunityPublishError('重复作品已不可见，请重试发布', 409);
+        return {
+            status: 'duplicate',
+            versionId: duplicate.version_id,
+            work: workStats(row, request.user.profile.handle, true),
+        };
+    }
+
+    const previous = db.prepare(`
+        SELECT w.id AS work_id
+        FROM work_versions v
+        JOIN works w ON w.id = v.work_id
+        WHERE w.type = 'character' AND w.author_handle = ?
+          AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
+          AND json_extract(v.payload_json, '$.externalSource.guildId') = ?
+          AND json_extract(v.payload_json, '$.externalSource.channelId') = ?
+          AND json_extract(v.payload_json, '$.externalSource.threadId') = ?
+        ORDER BY v.created_at DESC
+        LIMIT 1
+    `).get(
+        request.user.profile.handle,
+        discordSource.guildId,
+        discordSource.channelId,
+        discordSource.threadId,
+    );
+    const externalSource = {
+        provider: 'discord',
+        guildId: discordSource.guildId,
+        channelId: discordSource.channelId,
+        threadId: discordSource.threadId,
+        cardId: discordSource.cardId,
+        sourceUrl: discordSource.sourceUrl,
+        authorName: discordSource.authorName,
+        fileName: path.basename(source.characterPath),
+        fileSha256,
+        importedAt: nowIso(),
+    };
+    const result = await publishCommunitySource(request, {
+        sourceType: 'character',
+        sourceId,
+        workId: previous?.work_id || '',
+        title: discordSource.title,
+        tags: discordSource.tags,
+        versionNote: previous ? 'Discord 角色卡更新' : 'Discord 角色卡发布',
+    }, { source, externalSource });
+    return {
+        status: 'published',
+        versionId: result.work.latestVersionId,
+        work: result.work,
+        created: result.created,
+    };
+}
+
 router.post('/works/publish-discord', requireAdminMiddleware, async (request, response) => {
     try {
         const sourceId = String(request.body?.sourceId || '');
         const discordSource = normalizeDiscordPublicSource(request.body?.source);
-        const source = await capturePrivateSource(request, 'character', sourceId);
-        const fileSha256 = crypto.createHash('sha256').update(fs.readFileSync(source.characterPath)).digest('hex');
-        const db = getCommunityDb();
-
-        const duplicate = db.prepare(`
-            SELECT w.id AS work_id, v.id AS version_id
-            FROM work_versions v
-            JOIN works w ON w.id = v.work_id
-            WHERE w.type = 'character' AND w.status = 'published'
-              AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
-              AND json_extract(v.payload_json, '$.externalSource.fileSha256') = ?
-            ORDER BY v.created_at DESC
-            LIMIT 1
-        `).get(fileSha256);
-        if (duplicate) {
-            const row = getWorkRow(duplicate.work_id);
-            if (!row) throw new CommunityPublishError('重复作品已不可见，请重试发布', 409);
-            return response.json({
-                status: 'duplicate',
-                versionId: duplicate.version_id,
-                work: workStats(row, request.user.profile.handle, true),
-            });
-        }
-
-        const previous = db.prepare(`
-            SELECT w.id AS work_id
-            FROM work_versions v
-            JOIN works w ON w.id = v.work_id
-            WHERE w.type = 'character' AND w.author_handle = ?
-              AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
-              AND json_extract(v.payload_json, '$.externalSource.guildId') = ?
-              AND json_extract(v.payload_json, '$.externalSource.channelId') = ?
-              AND json_extract(v.payload_json, '$.externalSource.threadId') = ?
-            ORDER BY v.created_at DESC
-            LIMIT 1
-        `).get(
-            request.user.profile.handle,
-            discordSource.guildId,
-            discordSource.channelId,
-            discordSource.threadId,
-        );
-        const externalSource = {
-            provider: 'discord',
-            guildId: discordSource.guildId,
-            channelId: discordSource.channelId,
-            threadId: discordSource.threadId,
-            cardId: discordSource.cardId,
-            sourceUrl: discordSource.sourceUrl,
-            authorName: discordSource.authorName,
-            fileName: path.basename(source.characterPath),
-            fileSha256,
-            importedAt: nowIso(),
-        };
-        const result = await publishCommunitySource(request, {
-            sourceType: 'character',
-            sourceId,
-            workId: previous?.work_id || '',
-            title: discordSource.title,
-            tags: discordSource.tags,
-            versionNote: previous ? 'Discord 角色卡更新' : 'Discord 角色卡发布',
-        }, { source, externalSource });
-        return response.status(result.created ? 201 : 200).json({
-            status: 'published',
-            versionId: result.work.latestVersionId,
+        const result = await publishDiscordCharacter(request, sourceId, discordSource);
+        return response.status(result.status === 'published' && result.created ? 201 : 200).json({
+            status: result.status,
+            versionId: result.versionId,
             work: result.work,
         });
     } catch (error) {
         console.error('AIBAR Discord public publish failed:', error);
         const status = error instanceof CommunityPublishError ? error.status : 400;
+        return response.status(status).json({ error: publicError(error, '请求处理失败') });
+    }
+});
+
+export const DISCORD_BATCH_FETCH_CONCURRENCY = 3;
+const DISCORD_BATCH_MAX_ITEMS = 10;
+const DISCORD_CARD_URL_EXTENSIONS = new Set(['png', 'json', 'yaml', 'yml', 'charx', 'byaf']);
+const discordBatchRateLimiter = createUserRateLimiter({ points: 6, duration: 60, message: '批量发布过于频繁，请稍后再试' });
+
+/**
+ * 批量发布编排：附件抓取按 fetchConcurrency 并行（网络是耗时主体），
+ * 导入与发布串行化（同一用户目录与数据库，避免命名/事务竞态），单项失败互不影响。
+ * fetchItem/publishItem 以依赖注入方式传入，便于单测。
+ * @param {Array<object>} items 已校验的批量项
+ * @param {{ fetchItem: Function, publishItem: Function, fetchConcurrency?: number }} deps
+ * @returns {Promise<Array<object>>} 与 items 同序的逐项结果
+ */
+export async function runDiscordPublishBatch(items, { fetchItem, publishItem, fetchConcurrency = DISCORD_BATCH_FETCH_CONCURRENCY }) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    let importChain = Promise.resolve();
+    async function workerLoop() {
+        for (;;) {
+            const index = nextIndex;
+            nextIndex += 1;
+            if (index >= items.length) return;
+            const item = items[index];
+            try {
+                const fetched = await fetchItem(item, index);
+                // 每个 worker 等待自己的导入完成再抓下一项：内存中最多同时存在 fetchConcurrency 份附件
+                importChain = importChain
+                    .then(async () => {
+                        results[index] = await publishItem(item, fetched, index);
+                    })
+                    .catch((error) => {
+                        results[index] = { status: 'failed', error };
+                    });
+                await importChain;
+            } catch (error) {
+                results[index] = { status: 'failed', error };
+            }
+        }
+    }
+    const workerCount = Math.max(1, Math.min(fetchConcurrency, items.length));
+    await Promise.all(Array.from({ length: workerCount }, workerLoop));
+    return results;
+}
+
+router.post('/works/publish-discord-batch', requireAdminMiddleware, discordBatchRateLimiter, async (request, response) => {
+    try {
+        const rawItems = Array.isArray(request.body?.items) ? request.body.items : null;
+        if (!rawItems || !rawItems.length || rawItems.length > DISCORD_BATCH_MAX_ITEMS) {
+            throw new CommunityPublishError(`items 必须是 1 到 ${DISCORD_BATCH_MAX_ITEMS} 项的数组`);
+        }
+        // 全量预校验：任何一项参数非法则整个请求 4xx，不做半批执行
+        const items = rawItems.map((raw) => {
+            const url = validateDiscordAttachmentUrl(String(raw?.url || ''));
+            const extension = url.pathname.toLowerCase().split('.').pop() || '';
+            if (!DISCORD_CARD_URL_EXTENSIONS.has(extension)) {
+                throw new CommunityPublishError('附件不是受支持的卡体格式（PNG/JSON/CHARX/BYAF/YAML）');
+            }
+            return {
+                url: url.toString(),
+                format: extension,
+                source: normalizeDiscordPublicSource(raw?.source),
+            };
+        });
+        const results = await runDiscordPublishBatch(items, {
+            fetchItem: item => fetchDiscordAttachment(item.url),
+            publishItem: async (item, fetched) => {
+                const fileName = await importCharacterBuffer(fetched.buffer, item.format, request);
+                const published = await publishDiscordCharacter(request, `${fileName}.png`, item.source);
+                return { status: published.status, versionId: published.versionId, workId: published.work.id };
+            },
+        });
+        return response.json({
+            results: results.map((result, index) => {
+                const cardId = items[index].source.cardId;
+                if (result?.status === 'failed') {
+                    console.error('AIBAR Discord batch publish item failed:', result.error);
+                    return { index, cardId, status: 'failed', error: publicError(result.error, '发布失败') };
+                }
+                return { index, cardId, ...result };
+            }),
+        });
+    } catch (error) {
+        const status = (error instanceof CommunityPublishError || error instanceof DiscordImportFetchError)
+            ? (error.status || 400)
+            : 400;
         return response.status(status).json({ error: publicError(error, '请求处理失败') });
     }
 });
