@@ -18,6 +18,7 @@ import { getConfigValue } from '../util.js';
 export const router = express.Router();
 
 const registrationLimiter = new RateLimiterMemory({ points: 8, duration: 60 * 60 });
+const registrationStatusLimiter = new RateLimiterMemory({ points: 30, duration: 60 });
 const PREFER_REAL_IP_HEADER = getConfigValue('rateLimiting.preferRealIpHeader', false, 'boolean');
 const MAX_HANDLE_INPUT_LENGTH = 80;
 const MAX_HANDLE_LENGTH = 64;
@@ -222,8 +223,10 @@ router.post('/register', async (request, response) => {
     }
 });
 
-router.post('/registration-status', (request, response) => {
+router.post('/registration-status', async (request, response) => {
     try {
+        await registrationStatusLimiter.consume(registrationRateLimitKey(request));
+
         const id = String(request.body.id || '').trim();
         if (!id) return response.status(400).json({ error: '缺少申请编号' });
 
@@ -231,6 +234,9 @@ router.post('/registration-status', (request, response) => {
         if (!row) return response.status(404).json({ error: '没有找到该申请' });
         return response.json(registrationView(row));
     } catch (error) {
+        if (error instanceof RateLimiterRes) {
+            return retryAfter(response, error).status(429).json({ error: '查询过于频繁，请稍后再试' });
+        }
         console.error('AIBAR registration status failed:', error);
         return response.sendStatus(500);
     }

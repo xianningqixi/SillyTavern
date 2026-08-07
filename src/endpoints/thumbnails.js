@@ -261,6 +261,8 @@ publicRouter.get('/', async function (request, response) {
             const folder = getOriginalFolder(request.user.directories, type);
             const pathToOriginalFile = path.resolve(path.join(folder, file));
             if (!fs.existsSync(pathToOriginalFile)) return response.sendStatus(404);
+            // 缩略图内容由源文件派生，可安全缓存一天；Firefox 的特殊处理会在需要时覆盖该头。
+            response.setHeader('Cache-Control', 'public, max-age=86400');
             invalidateFirefoxCache(pathToOriginalFile, request, response);
             return response.sendFile(pathToOriginalFile);
         };
@@ -295,6 +297,8 @@ publicRouter.get('/', async function (request, response) {
         }
 
         if (fs.existsSync(pathToCachedFile)) {
+            // 缩略图内容由源文件派生，可安全缓存一天；Firefox 的特殊处理会在需要时覆盖该头。
+            response.setHeader('Cache-Control', 'public, max-age=86400');
             invalidateFirefoxCache(pathToCachedFile, request, response);
             return response.sendFile(file, { root: thumbnailFolder, dotfiles: 'allow' });
         }

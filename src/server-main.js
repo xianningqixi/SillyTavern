@@ -242,7 +242,18 @@ app.get('/login', loginPageMiddleware);
 const webpackMiddleware = getWebpackServeMiddleware();
 app.use(webpackMiddleware);
 app.use(userCssMiddleware);
-app.use(express.static(path.join(serverDirectory, 'public'), {}));
+// AIBAR 的构建产物带内容哈希，可以长期缓存；入口 index.html 必须每次重新校验。其他静态资源保持默认的 ETag 协商缓存。
+const aibarAssetsDirectory = path.join(serverDirectory, 'public', 'aibar', 'assets') + path.sep;
+const aibarIndexHtmlPath = path.join(serverDirectory, 'public', 'aibar', 'index.html');
+app.use(express.static(path.join(serverDirectory, 'public'), {
+    setHeaders: (staticResponse, filePath) => {
+        if (filePath.startsWith(aibarAssetsDirectory)) {
+            staticResponse.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        } else if (filePath === aibarIndexHtmlPath) {
+            staticResponse.setHeader('Cache-Control', 'no-cache');
+        }
+    },
+}));
 
 // Public API
 app.use('/api/users', usersPublicRouter);

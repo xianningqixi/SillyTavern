@@ -7,6 +7,8 @@ import sanitize from 'sanitize-filename';
 import storage from 'node-persist';
 import { sync as writeFileSyncAtomic } from 'write-file-atomic';
 
+import { publicError } from '../aibar-errors.js';
+import { createUserRateLimiter } from '../aibar-rate-limit.js';
 import { getCommunityDb, getCommunityRoot, hashInviteCode } from '../aibar-community-db.js';
 import {
     finalizeRegistrationAccount,
@@ -32,7 +34,12 @@ import {
 
 export const router = express.Router();
 
+const publishRateLimiter = createUserRateLimiter({ points: 12, duration: 60, message: '发布操作过于频繁，请稍后再试' });
+const launchRateLimiter = createUserRateLimiter({ points: 12, duration: 60, message: '启动操作过于频繁，请稍后再试' });
+const commentRateLimiter = createUserRateLimiter({ points: 20, duration: 60, message: '评论发送过于频繁，请稍后再试' });
+
 const MAX_PAGE_SIZE = 48;
+const WORK_VERSIONS_MAX_ITEMS = 50;
 const IMMUTABLE_COVER_CACHE_CONTROL = 'private, max-age=31536000, immutable';
 const MAX_TAGS = 8;
 const MAX_MOD_SNAPSHOT_BYTES = 64 * 1024;
@@ -923,7 +930,7 @@ router.post('/admin/discord-import/batches', requireAdminMiddleware, (request, r
         return response.status(created ? 201 : 200).json(discordImportBatchJson(db, current));
     } catch (error) {
         console.error('AIBAR Discord batch registration failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -939,7 +946,7 @@ router.get('/admin/discord-import/batches/latest', requireAdminMiddleware, (requ
         return response.json(discordImportBatchJson(db, batch));
     } catch (error) {
         console.error('AIBAR Discord batch read failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -952,7 +959,7 @@ router.post('/admin/discord-import/batches/:batchId/clear', requireAdminMiddlewa
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR Discord batch clear failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1001,7 +1008,7 @@ router.post('/admin/discord-import/items/:itemId/resolve', requireAdminMiddlewar
         return response.send(attachment.buffer);
     } catch (error) {
         const updatedAt = nowIso();
-        const message = String(error.message || error).slice(0, 1000);
+        const message = publicError(error, 'Discord 导入处理失败').slice(0, 1000);
         db.transaction(() => {
             db.prepare(`
                 UPDATE discord_import_items SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?
@@ -1058,7 +1065,7 @@ router.post('/admin/discord-import/items/:itemId/upload', requireAdminMiddleware
         return response.json(discordImportItemJson(db.prepare('SELECT * FROM discord_import_items WHERE id = ?').get(item.id)));
     } catch (error) {
         console.error('AIBAR Discord item upload failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     } finally {
         if (uploadPath && fs.existsSync(uploadPath)) fs.rmSync(uploadPath, { force: true });
     }
@@ -1087,7 +1094,7 @@ router.post('/admin/discord-import/items/:itemId/fail', requireAdminMiddleware, 
         return response.json(discordImportItemJson(db.prepare('SELECT * FROM discord_import_items WHERE id = ?').get(item.id)));
     } catch (error) {
         console.error('AIBAR Discord item failure update failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1113,8 +1120,10 @@ router.post('/works/list', (request, response) => {
         }
 
         if (search) {
-            where.push('(w.title LIKE ? OR w.summary LIKE ? OR w.author_name LIKE ? OR w.author_handle LIKE ?)');
-            const query = `%${search}%`;
+            // 转义 LIKE 通配符，防止用户输入 % 或 _ 扫描全表内容。
+            const escapedSearch = search.replace(/[\\%_]/g, '\\$&');
+            where.push('(w.title LIKE ? ESCAPE \'\\\' OR w.summary LIKE ? ESCAPE \'\\\' OR w.author_name LIKE ? ESCAPE \'\\\' OR w.author_handle LIKE ? ESCAPE \'\\\')');
+            const query = `%${escapedSearch}%`;
             params.push(query, query, query, query);
         }
         if (tag) {
@@ -1154,7 +1163,7 @@ router.post('/works/list', (request, response) => {
         return response.json({ works, page, pageSize, hasMore: rows.length === pageSize });
     } catch (error) {
         console.error('AIBAR work list failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1167,6 +1176,7 @@ router.post('/works/get', (request, response) => {
         const versions = db.prepare(`
             SELECT id, version_number, version_note, title, summary, created_at
             FROM work_versions WHERE work_id = ? ORDER BY version_number DESC
+            LIMIT ${WORK_VERSIONS_MAX_ITEMS}
         `).all(row.id).map(version => ({
             id: version.id,
             versionNumber: version.version_number,
@@ -1208,7 +1218,7 @@ router.post('/works/get', (request, response) => {
         });
     } catch (error) {
         console.error('AIBAR work detail failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1350,14 +1360,14 @@ async function publishCommunitySource(request, input, options = {}) {
     }
 }
 
-router.post('/works/publish', async (request, response) => {
+router.post('/works/publish', publishRateLimiter, async (request, response) => {
     try {
         const result = await publishCommunitySource(request, request.body || {});
         return response.status(result.created ? 201 : 200).json(result.work);
     } catch (error) {
         console.error('AIBAR publish failed:', error);
         const status = error instanceof CommunityPublishError ? error.status : 400;
-        return response.status(status).json({ error: String(error.message || error) });
+        return response.status(status).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1434,7 +1444,7 @@ router.post('/works/publish-discord', requireAdminMiddleware, async (request, re
     } catch (error) {
         console.error('AIBAR Discord public publish failed:', error);
         const status = error instanceof CommunityPublishError ? error.status : 400;
-        return response.status(status).json({ error: String(error.message || error) });
+        return response.status(status).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1528,7 +1538,7 @@ router.post('/admin/discord-import/items/:itemId/publish', requireAdminMiddlewar
         const updated = db.prepare('SELECT * FROM discord_import_items WHERE id = ?').get(item.id);
         return response.status(result.created ? 201 : 200).json({ item: discordImportItemJson(updated), work: result.work });
     } catch (error) {
-        const message = String(error.message || error).slice(0, 1000);
+        const message = publicError(error, 'Discord 导入处理失败').slice(0, 1000);
         const updatedAt = nowIso();
         db.transaction(() => {
             db.prepare(`
@@ -1594,7 +1604,7 @@ router.post('/works/status', (request, response) => {
         return response.json(workStats(row, request.user.profile.handle, request.user.profile.admin));
     } catch (error) {
         console.error('AIBAR work status update failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1621,7 +1631,7 @@ router.post('/works/delete', (request, response) => {
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR work delete failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1643,7 +1653,7 @@ router.post('/works/favorite', (request, response) => {
         ));
     } catch (error) {
         console.error('AIBAR favorite failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1667,11 +1677,11 @@ router.post('/works/rate', (request, response) => {
         ));
     } catch (error) {
         console.error('AIBAR rating failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
-router.post('/works/comments/add', (request, response) => {
+router.post('/works/comments/add', commentRateLimiter, (request, response) => {
     try {
         const workId = String(request.body.id || '');
         const body = String(request.body.body || '').trim().slice(0, 2000);
@@ -1686,7 +1696,7 @@ router.post('/works/comments/add', (request, response) => {
         return response.status(201).json({ id, body, userHandle: request.user.profile.handle, userName: request.user.profile.name, createdAt: now, updatedAt: now, mine: true });
     } catch (error) {
         console.error('AIBAR comment failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1702,11 +1712,11 @@ router.post('/works/comments/delete', (request, response) => {
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR comment delete failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
-router.post('/works/launch', async (request, response) => {
+router.post('/works/launch', launchRateLimiter, async (request, response) => {
     const journal = createRollbackJournal();
     try {
         const db = getCommunityDb();
@@ -1805,7 +1815,7 @@ router.post('/works/launch', async (request, response) => {
             console.error('AIBAR launch rollback failed:', rollbackError);
         }
         console.error('AIBAR launch failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1820,7 +1830,7 @@ router.post('/works/launch-complete', (request, response) => {
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR launch completion failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1887,7 +1897,7 @@ router.post('/admin/invites/create', requireAdminMiddleware, (request, response)
         return response.status(201).json({ id, code, label, maxUses, useCount: 0, expiresAt, enabled: true, createdAt });
     } catch (error) {
         console.error('AIBAR invite creation failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -1899,7 +1909,7 @@ router.post('/admin/invites/toggle', requireAdminMiddleware, (request, response)
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR invite toggle failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
     }
 });
 
@@ -2015,6 +2025,6 @@ router.post('/admin/registrations/review', requireAdminMiddleware, async (reques
             `).run(approvalClaim.id, approvalClaim.token);
         }
         console.error('AIBAR registration review failed:', error);
-        return response.status(error.statusCode || 400).json({ error: String(error.message || error) });
+        return response.status(error.statusCode || 400).json({ error: publicError(error, '请求处理失败') });
     }
 });

@@ -4,6 +4,8 @@ import express from 'express';
 import storage from 'node-persist';
 
 import { CHAT_COMPLETION_SOURCES } from '../constants.js';
+import { publicError } from '../aibar-errors.js';
+import { createUserRateLimiter } from '../aibar-rate-limit.js';
 import { getCommunityDb, hashInviteCode } from '../aibar-community-db.js';
 import { KEY_PREFIX, getUserDirectories, requireAdminMiddleware, toKey } from '../users.js';
 import { checkChatCompletionStatus, generateChatCompletion } from './backends/chat-completions.js';
@@ -14,7 +16,12 @@ export const router = express.Router();
 const POINT_SCALE = 1_000_000;
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
 const STALE_RESERVATION_MINUTES = 30;
+const GENERATE_MAX_MESSAGES = 400;
+const GENERATE_MAX_MESSAGES_LENGTH = 400_000;
+const GENERATE_MAX_CONCURRENCY = 3;
 const activeReservationIds = new Set();
+/** @type {Map<string, number>} 每个用户当前进行中的共享生成请求数 */
+const activeGenerationCounts = new Map();
 const supportedSources = new Set([
     CHAT_COMPLETION_SOURCES.OPENAI,
     CHAT_COMPLETION_SOURCES.CLAUDE,
@@ -330,16 +337,19 @@ export function summarizeCapture(capture, estimatedInputTokens) {
         inputTokens: inputTokens || estimatedInputTokens,
         outputTokens: outputTokens || estimateTextTokens(content),
         hasError,
+        hasContent: content.trim().length > 0,
         usageReported: inputTokens > 0 || outputTokens > 0,
     };
 }
 
-function settleGeneration(reservation, model, capture, estimatedInputTokens) {
+export function settleGeneration(reservation, model, capture, estimatedInputTokens) {
     try {
         const db = getCommunityDb();
         const summary = summarizeCapture(capture, estimatedInputTokens);
         const failed = capture.statusCode >= 400 || summary.hasError;
-        const calculatedMicros = failed ? 0 : calculateCostMicros(
+        // 流式响应中途出错但已经产出内容时，仍按实际用量计费；完全没有内容才免单。
+        const billable = capture.statusCode < 400 && (!summary.hasError || summary.hasContent);
+        const calculatedMicros = !billable ? 0 : calculateCostMicros(
             summary.inputTokens,
             model.input_price_micros,
             summary.outputTokens,
@@ -460,6 +470,31 @@ function applySharedModel(body, model, directories) {
             body.proxy_password = readSecret(directories, secretKey, model.secret_id) || undefined;
         }
     }
+}
+
+/**
+ * 校验共享生成请求的消息列表，越界或格式非法时返回中文错误文案。
+ * @param {any} messages 请求中的 messages 字段
+ * @returns {string|null} 错误文案；合法时返回 null
+ */
+export function validateGenerationMessages(messages) {
+    if (!Array.isArray(messages) && typeof messages !== 'string') {
+        return '缺少有效的消息列表';
+    }
+    if (Array.isArray(messages)) {
+        if (messages.length > GENERATE_MAX_MESSAGES) {
+            return `消息数量超过上限（${GENERATE_MAX_MESSAGES} 条）`;
+        }
+        for (const message of messages) {
+            if (typeof message !== 'string' && (typeof message !== 'object' || message === null)) {
+                return '消息列表包含无效条目';
+            }
+        }
+    }
+    if (JSON.stringify(messages).length > GENERATE_MAX_MESSAGES_LENGTH) {
+        return `消息内容超过长度上限（${GENERATE_MAX_MESSAGES_LENGTH.toLocaleString('en-US')} 字符）`;
+    }
+    return null;
 }
 
 function trustedGenerationBody(body, maxOutputTokens) {
@@ -596,7 +631,7 @@ router.post('/admin/models/save', requireAdminMiddleware, (request, response) =>
         }));
     } catch (error) {
         console.error('AIBAR model save failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '模型保存失败') });
     }
 });
 
@@ -608,7 +643,7 @@ router.post('/admin/models/delete', requireAdminMiddleware, (request, response) 
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR model delete failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '模型删除失败') });
     }
 });
 
@@ -631,15 +666,29 @@ router.post('/admin/models/test', requireAdminMiddleware, async (request, respon
         return await checkChatCompletionStatus(request, response);
     } catch (error) {
         console.error('AIBAR model test failed:', error);
-        return response.status(500).json({ error: String(error.message || error) });
+        return response.status(500).json({ error: publicError(error, '模型连通性测试失败') });
     }
 });
 
-router.post('/models/generate', async (request, response) => {
+const generateRateLimiter = createUserRateLimiter({ points: 20, duration: 60, message: '生成请求过于频繁，请稍后再试' });
+
+router.post('/models/generate', generateRateLimiter, async (request, response) => {
+    const userHandle = String(request.user?.profile?.handle || '');
+    // 每个用户最多同时进行 3 个共享生成请求，防止并发挤占共享额度。
+    const activeCount = activeGenerationCounts.get(userHandle) || 0;
+    if (activeCount >= GENERATE_MAX_CONCURRENCY) {
+        return response.status(429).json({ error: { message: '同时进行的生成请求过多，请等待现有回复完成' } });
+    }
+    activeGenerationCounts.set(userHandle, activeCount + 1);
+
     let reservation;
     try {
         if (!request.body || typeof request.body !== 'object') {
             return response.status(400).json({ error: { message: '请求内容无效' } });
+        }
+        const messagesError = validateGenerationMessages(request.body.messages);
+        if (messagesError) {
+            return response.status(400).json({ error: { message: messagesError } });
         }
         const modelId = String(request.body?.aibar_model_id || '').trim();
         const model = getCommunityDb().prepare('SELECT * FROM shared_models WHERE id = ? AND enabled = 1').get(modelId);
@@ -652,9 +701,6 @@ router.post('/models/generate', async (request, response) => {
             return response.status(503).json({ error: { message: '模型所属管理员账号不可用' } });
         }
 
-        if (!Array.isArray(request.body.messages) && typeof request.body.messages !== 'string') {
-            return response.status(400).json({ error: { message: '缺少有效的消息列表' } });
-        }
         const reservationInputTokens = estimateInputTokens(request.body.messages);
         const settlementInputTokens = estimateSettlementInputTokens(request.body.messages);
         const maxOutputTokens = Math.round(clampNumber(
@@ -684,7 +730,18 @@ router.post('/models/generate', async (request, response) => {
             });
         }
         console.error('AIBAR shared generation failed:', error);
-        return response.status(500).json({ error: { message: String(error.message || error) } });
+        // 流式响应已经开始发送时不能再写状态码，直接结束响应即可。
+        if (response.headersSent) {
+            return response.end();
+        }
+        return response.status(500).json({ error: { message: publicError(error, '生成请求失败，请稍后重试') } });
+    } finally {
+        const current = activeGenerationCounts.get(userHandle) || 1;
+        if (current <= 1) {
+            activeGenerationCounts.delete(userHandle);
+        } else {
+            activeGenerationCounts.set(userHandle, current - 1);
+        }
     }
 });
 
@@ -711,7 +768,9 @@ router.post('/points/me', (request, response) => {
     }
 });
 
-router.post('/points/redeem', (request, response) => {
+const redeemRateLimiter = createUserRateLimiter({ points: 10, duration: 60 * 60, message: '兑换尝试过于频繁，请一小时后再试' });
+
+router.post('/points/redeem', redeemRateLimiter, (request, response) => {
     try {
         const code = String(request.body.code || '').trim();
         if (!code) return response.status(400).json({ error: '请输入额度卡兑换码' });
@@ -749,7 +808,7 @@ router.post('/points/redeem', (request, response) => {
         })();
         return response.json(accountView(redeemed));
     } catch (error) {
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '兑换失败，请稍后再试') });
     }
 });
 
@@ -787,7 +846,7 @@ router.post('/admin/points/codes/create', requireAdminMiddleware, (request, resp
         return response.status(201).json({ cards });
     } catch (error) {
         console.error('AIBAR credit code creation failed:', error);
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '额度卡创建失败') });
     }
 });
 
@@ -799,7 +858,7 @@ router.post('/admin/points/codes/toggle', requireAdminMiddleware, (request, resp
         if (!result.changes) return response.status(404).json({ error: '额度卡不存在或已兑换' });
         return response.sendStatus(204);
     } catch (error) {
-        return response.status(400).json({ error: String(error.message || error) });
+        return response.status(400).json({ error: publicError(error, '额度卡更新失败') });
     }
 });
 

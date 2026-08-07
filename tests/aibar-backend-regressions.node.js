@@ -50,6 +50,8 @@ const [
     { getChatDataStrict },
     { isCsrfProtectionDisabled, setupPrivateEndpoints },
     { getClaudeApiConfig },
+    { createUserRateLimiter },
+    { publicError },
 ] = await Promise.all([
     import('../src/aibar-community-db.js'),
     import('../src/aibar-community-previews.js'),
@@ -60,6 +62,8 @@ const [
     import('../src/endpoints/chats.js'),
     import('../src/server-startup.js'),
     import('../src/endpoints/backends/chat-completions.js'),
+    import('../src/aibar-rate-limit.js'),
+    import('../src/aibar-errors.js'),
 ]);
 
 globalThis.DATA_ROOT = path.relative(process.cwd(), testRoot);
@@ -73,10 +77,12 @@ const {
     legacyProviderGuard,
     releaseStaleReservations,
     router: modelsRouter,
+    settleGeneration,
     sharedModelGuard,
     summarizeCapture,
     trackActiveReservation,
     untrackActiveReservation,
+    validateGenerationMessages,
 } = modelsModule;
 const { normalizeRegistrationHandle, registrationRateLimitKey } = publicModule;
 
@@ -165,6 +171,8 @@ test('strict chat reads distinguish a missing chat from malformed JSONL', () => 
 const registerUser = getRouteHandler(publicModule.router, '/register');
 const saveImage = getRouteHandler(aibarRouter, '/images/save');
 const saveStory = getRouteHandler(aibarRouter, '/stories/save');
+const listStories = getRouteHandler(aibarRouter, '/stories/list');
+const generateShared = getRouteHandler(modelsRouter, '/models/generate');
 const listWorks = getRouteHandler(communityRouter, '/works/list');
 const getWork = getRouteHandler(communityRouter, '/works/get');
 const publishWork = getRouteHandler(communityRouter, '/works/publish');
@@ -576,6 +584,7 @@ test('settlement prefers provider usage and does not count wrapped Claude conten
         inputTokens: 123,
         outputTokens: 7,
         hasError: false,
+        hasContent: true,
         usageReported: true,
     });
 
@@ -1497,4 +1506,255 @@ test('publish finalization failure leaves no committed database rows', async (t)
         LEFT JOIN works w ON w.id = v.work_id
         WHERE v.title = ? OR w.id IS NULL
     `).get(title).count, 0);
+});
+
+test('the per-user rate limiter rejects excess requests with 429 and isolates users', async () => {
+    const limiter = createUserRateLimiter({ points: 2, duration: 60, message: '测试限流' });
+    const run = async (handle) => {
+        const result = { status: 200, body: null, headers: {}, nextCalls: 0 };
+        const response = {
+            headersSent: false,
+            set(name, value) {
+                result.headers[String(name).toLowerCase()] = String(value);
+                return this;
+            },
+            status(value) {
+                result.status = value;
+                return this;
+            },
+            json(value) {
+                result.body = value;
+                return this;
+            },
+        };
+        await limiter({ user: { profile: { handle } } }, response, () => { result.nextCalls += 1; });
+        return result;
+    };
+
+    assert.equal((await run('rate-limit-user')).nextCalls, 1);
+    assert.equal((await run('rate-limit-user')).nextCalls, 1);
+    const limited = await run('rate-limit-user');
+    assert.equal(limited.status, 429);
+    assert.equal(limited.nextCalls, 0);
+    assert.match(limited.body.error, /测试限流/);
+    assert.ok(Number(limited.headers['retry-after']) >= 1);
+    assert.equal((await run('other-rate-limit-user')).nextCalls, 1, 'other users must not share the budget');
+});
+
+test('expensive AIBAR routes are mounted behind per-user rate limiters', () => {
+    const guardedRoutes = [
+        [modelsRouter, '/models/generate'],
+        [modelsRouter, '/points/redeem'],
+        [aibarRouter, '/discord-import/fetch'],
+        [aibarRouter, '/images/save'],
+        [communityRouter, '/works/publish'],
+        [communityRouter, '/works/launch'],
+        [communityRouter, '/works/comments/add'],
+    ];
+    for (const [router, routePath] of guardedRoutes) {
+        const layer = router.stack.find(item => item.route?.path === routePath && item.route.methods.post);
+        assert.ok(layer, routePath);
+        assert.ok(layer.route.stack.length >= 2, `${routePath} must have a middleware in front of the handler`);
+        assert.equal(layer.route.stack[0].handle.name, 'userRateLimit', routePath);
+    }
+});
+
+test('the story list skips corrupt files, strips oversized covers, and caps at 200 items', async () => {
+    const storiesDirectory = path.join(userRoot, 'aibar', 'stories');
+    fs.writeFileSync(path.join(storiesDirectory, 'corrupt-story.json'), '{ not json', 'utf8');
+    fs.writeFileSync(path.join(storiesDirectory, 'big-cover-story.json'), JSON.stringify({
+        id: 'big-cover-story',
+        title: 'Big Cover',
+        characterAvatar,
+        updatedAt: '2099-01-01T00:00:00.000Z',
+        coverImage: `data:image/png;base64,${'A'.repeat(70_000)}`,
+    }), 'utf8');
+
+    const listed = await suppressExpectedErrors(() => invokeRoute(listStories, {}));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.some(story => story.id === 'corrupt-story'), false, 'corrupt stories must be skipped');
+    assert.equal(listed.body.find(story => story.id === 'big-cover-story').coverImage, '', 'oversized covers must be stripped');
+    assert.equal(listed.body.some(story => story.id === 'valid-mod-story'), true, 'valid stories must still be listed');
+
+    for (let index = 0; index < 210; index += 1) {
+        fs.writeFileSync(
+            path.join(storiesDirectory, `bulk-story-${index}.json`),
+            JSON.stringify({ id: `bulk-story-${index}`, title: 'Bulk', characterAvatar }),
+            'utf8',
+        );
+    }
+    const capped = await suppressExpectedErrors(() => invokeRoute(listStories, {}));
+    assert.equal(capped.status, 200);
+    assert.equal(capped.body.length, 200);
+});
+
+test('shared generation rejects oversized or malformed message payloads', async () => {
+    assert.equal(validateGenerationMessages([{ role: 'user', content: 'hi' }]), null);
+    assert.equal(validateGenerationMessages('prompt'), null);
+    assert.match(validateGenerationMessages(Array.from({ length: 401 }, () => ({ content: 'x' }))), /上限/);
+    assert.match(validateGenerationMessages([42]), /无效/);
+    assert.match(validateGenerationMessages(null), /消息列表/);
+    assert.match(validateGenerationMessages([{ content: 'y'.repeat(400_001) }]), /长度上限/);
+
+    const tooMany = await suppressExpectedErrors(() => invokeRoute(generateShared, {
+        aibar_model_id: 'any',
+        messages: Array.from({ length: 401 }, () => ({ content: 'x' })),
+    }, { handle: 'bounds-user', name: 'Bounds', admin: false }));
+    assert.equal(tooMany.status, 400);
+    assert.match(tooMany.body.error.message, /消息数量/);
+
+    const badEntry = await suppressExpectedErrors(() => invokeRoute(generateShared, {
+        aibar_model_id: 'any',
+        messages: [{ content: 'ok' }, 42],
+    }, { handle: 'bounds-user', name: 'Bounds', admin: false }));
+    assert.equal(badEntry.status, 400);
+    assert.match(badEntry.body.error.message, /无效/);
+});
+
+test('public error messages hide internal details but keep validation text', async () => {
+    const validation = new Error('作品标题不能为空');
+    assert.equal(publicError(validation, '请求处理失败'), '作品标题不能为空');
+
+    const statusError = new Error('自定义校验失败');
+    statusError.statusCode = 422;
+    assert.equal(publicError(statusError, '请求处理失败'), '自定义校验失败');
+
+    await suppressExpectedErrors(() => {
+        const fsError = new Error(`ENOENT: no such file or directory, open '${path.join(userRoot, 'secret.json')}'`);
+        fsError.code = 'ENOENT';
+        fsError.syscall = 'open';
+        assert.equal(publicError(fsError, '请求处理失败'), '请求处理失败');
+
+        const sqliteError = new Error('UNIQUE constraint failed: works.id');
+        sqliteError.code = 'SQLITE_CONSTRAINT_PRIMARYKEY';
+        assert.equal(publicError(sqliteError, '请求处理失败'), '请求处理失败');
+
+        assert.equal(publicError(new SyntaxError('Unexpected token in JSON'), '请求处理失败'), '请求处理失败');
+    });
+});
+
+test('settlement charges produced content even when the stream reports a trailing error', () => {
+    const db = getCommunityDb();
+    const model = { id: 'partial-billing-model', input_price_micros: 10, output_price_micros: 20 };
+    const now = new Date().toISOString();
+    const insertReservedUsage = (usageId, handle, reservedMicros) => {
+        db.prepare(`
+            INSERT OR REPLACE INTO point_accounts (user_handle, balance_micros, held_micros, updated_at)
+            VALUES (?, 1000000, ?, ?)
+        `).run(handle, reservedMicros, now);
+        db.prepare(`
+            INSERT INTO model_usage (
+                id, user_handle, model_id, input_tokens, reserved_micros, status, created_at
+            ) VALUES (?, ?, ?, 0, ?, 'reserved', ?)
+        `).run(usageId, handle, model.id, reservedMicros, now);
+    };
+
+    insertReservedUsage('partial-billing-usage', 'partial-billing-user', 500);
+    settleGeneration({ usageId: 'partial-billing-usage' }, model, {
+        body: null,
+        chunks: [
+            'data: {"choices":[{"delta":{"content":"partial reply"}}]}\n\n',
+            'data: {"error":{"message":"stream aborted"}}\n\n',
+        ],
+        statusCode: 200,
+    }, 50);
+    const partial = db.prepare('SELECT * FROM model_usage WHERE id = ?').get('partial-billing-usage');
+    assert.equal(partial.status, 'failed');
+    assert.ok(partial.charged_micros > 0, 'produced content must still be charged');
+    assert.equal(db.prepare(`
+        SELECT COUNT(*) AS count FROM point_ledger WHERE reference_id = ?
+    `).get('partial-billing-usage').count, 1);
+
+    insertReservedUsage('empty-billing-usage', 'empty-billing-user', 500);
+    settleGeneration({ usageId: 'empty-billing-usage' }, model, {
+        body: null,
+        chunks: ['data: {"error":{"message":"upstream exploded"}}\n\n'],
+        statusCode: 200,
+    }, 50);
+    const empty = db.prepare('SELECT * FROM model_usage WHERE id = ?').get('empty-billing-usage');
+    assert.equal(empty.status, 'failed');
+    assert.equal(empty.charged_micros, 0, 'content-free errors stay free');
+
+    insertReservedUsage('http-failure-usage', 'http-failure-user', 500);
+    settleGeneration({ usageId: 'http-failure-usage' }, model, {
+        body: null,
+        chunks: ['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'],
+        statusCode: 502,
+    }, 50);
+    const httpFailure = db.prepare('SELECT * FROM model_usage WHERE id = ?').get('http-failure-usage');
+    assert.equal(httpFailure.status, 'failed');
+    assert.equal(httpFailure.charged_micros, 0, 'HTTP-level failures stay free');
+});
+
+test('PNG character metadata survives zTXt/iTXt chunks, broken CRCs and corrupt ccv3 payloads', async () => {
+    const zlib = await import('node:zlib');
+    const crc32 = (await import('crc-32')).default;
+    const { read } = await import('../src/character-card-parser.js');
+
+    const signature = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    /** @type {(name: string, data: Buffer, corruptCrc?: boolean) => Buffer} */
+    const pngChunk = (name, data, corruptCrc = false) => {
+        const nameBuffer = Buffer.from(name, 'latin1');
+        const length = Buffer.alloc(4);
+        length.writeUInt32BE(data.length);
+        const crcBuffer = Buffer.alloc(4);
+        const crcValue = (crc32.buf(Buffer.concat([nameBuffer, data])) >>> 0);
+        crcBuffer.writeUInt32BE(corruptCrc ? ((crcValue ^ 0xDEADBEEF) >>> 0) : crcValue);
+        return Buffer.concat([length, nameBuffer, data, crcBuffer]);
+    };
+    const ihdrData = Buffer.alloc(13);
+    ihdrData.writeUInt32BE(1, 0);
+    ihdrData.writeUInt32BE(1, 4);
+    ihdrData[8] = 8;
+    ihdrData[9] = 6;
+    /** @type {(chunks: Buffer[], trailing?: Buffer) => Buffer} */
+    const buildPng = (chunks, trailing = Buffer.alloc(0)) => Buffer.concat([
+        signature,
+        pngChunk('IHDR', ihdrData),
+        ...chunks,
+        pngChunk('IEND', Buffer.alloc(0)),
+        trailing,
+    ]);
+    /** @type {(json: object) => string} */
+    const encodeCard = json => Buffer.from(JSON.stringify(json), 'utf8').toString('base64');
+
+    const v2Card = { name: '测试角色', description: 'v2' };
+    const v3Card = { spec: 'chara_card_v3', data: { name: '测试角色', description: 'v3' } };
+
+    // zTXt：keyword \0 compressionMethod(0) + deflate(base64)
+    const ztxtData = Buffer.concat([
+        Buffer.from('chara', 'latin1'),
+        Buffer.from([0, 0]),
+        zlib.deflateSync(Buffer.from(encodeCard(v2Card), 'latin1')),
+    ]);
+    assert.deepEqual(JSON.parse(read(buildPng([pngChunk('zTXt', ztxtData)]))), v2Card);
+
+    // iTXt（压缩）：keyword \0 compFlag(1) compMethod(0) lang \0 translated \0 deflate(base64)
+    const itxtData = Buffer.concat([
+        Buffer.from('ccv3', 'latin1'),
+        Buffer.from([0, 1, 0, 0, 0]),
+        zlib.deflateSync(Buffer.from(encodeCard(v3Card), 'utf8')),
+    ]);
+    assert.deepEqual(JSON.parse(read(buildPng([pngChunk('iTXt', itxtData)]))), v3Card);
+
+    // CRC 损坏 + IEND 后尾随垃圾：仍能读出 tEXt chara
+    const textData = Buffer.concat([
+        Buffer.from('chara', 'latin1'),
+        Buffer.from([0]),
+        Buffer.from(encodeCard(v2Card), 'latin1'),
+    ]);
+    const brokenPng = buildPng([pngChunk('tEXt', textData, true)], Buffer.from('junk-after-iend'));
+    assert.deepEqual(JSON.parse(read(brokenPng)), v2Card);
+
+    // ccv3 载荷损坏时回退到有效的 chara，而不是判死整张卡
+    const corruptCcv3 = Buffer.concat([
+        Buffer.from('ccv3', 'latin1'),
+        Buffer.from([0]),
+        Buffer.from('!!not-base64-json!!', 'latin1'),
+    ]);
+    const mixedPng = buildPng([pngChunk('tEXt', corruptCcv3), pngChunk('tEXt', textData)]);
+    assert.deepEqual(JSON.parse(read(mixedPng)), v2Card);
+
+    // 没有任何角色数据 chunk：保持原错误语义
+    assert.throws(() => read(buildPng([])), /No PNG metadata/);
 });

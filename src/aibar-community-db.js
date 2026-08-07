@@ -222,6 +222,10 @@ CREATE TABLE IF NOT EXISTS user_budgets (
 
 CREATE INDEX IF NOT EXISTS idx_works_latest ON works(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_works_author ON works(author_handle, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_works_type ON works(type);
+CREATE INDEX IF NOT EXISTS idx_favorites_work ON favorites(work_id);
+CREATE INDEX IF NOT EXISTS idx_ratings_work ON ratings(work_id);
+CREATE INDEX IF NOT EXISTS idx_comments_work_status ON comments(work_id, status);
 CREATE INDEX IF NOT EXISTS idx_versions_work ON work_versions(work_id, version_number DESC);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON work_tags(tag, version_id);
 CREATE INDEX IF NOT EXISTS idx_discord_batches_requester ON discord_import_batches(requested_by, updated_at DESC);

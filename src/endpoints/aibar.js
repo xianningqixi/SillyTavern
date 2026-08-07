@@ -6,6 +6,9 @@ import express from 'express';
 import sanitize from 'sanitize-filename';
 import { sync as writeFileSyncAtomic } from 'write-file-atomic';
 
+import { publicError } from '../aibar-errors.js';
+import { createUserRateLimiter } from '../aibar-rate-limit.js';
+
 export const router = express.Router();
 
 const DISCORD_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
@@ -21,6 +24,11 @@ const STORY_MESSAGE_MAX_LENGTH = 50_000;
 const STORY_TIMESTAMP_MAX_LENGTH = 64;
 const STORY_LIST_MAX_ITEMS = 50;
 const STORY_TAG_MAX_LENGTH = 100;
+// 列表接口最多返回最近的 200 个故事，超长封面在列表中省略，避免响应体无限膨胀。
+const STORY_LIST_MAX_STORIES = 200;
+const STORY_LIST_COVER_IMAGE_MAX_LENGTH = 65_536;
+const USER_STORY_MAX_COUNT = 500;
+const USER_IMAGE_MAX_COUNT = 1000;
 // Community MOD ids can reach ~170 characters (source id + import suffix), so keep references intact.
 const STORY_REFERENCE_MAX_LENGTH = 200;
 // A data URL cover cannot be larger than the saved image budget: base64 overhead + a short "data:...;base64," prefix.
@@ -128,7 +136,10 @@ function getStoriesDirectory(request) {
     return path.resolve(request.user.directories.root, 'aibar', 'stories');
 }
 
-router.post('/discord-import/fetch', async (request, response) => {
+const discordImportFetchLimiter = createUserRateLimiter({ points: 10, duration: 60, message: 'Discord 附件下载过于频繁，请稍后再试' });
+const imageSaveLimiter = createUserRateLimiter({ points: 30, duration: 60, message: '图片保存过于频繁，请稍后再试' });
+
+router.post('/discord-import/fetch', discordImportFetchLimiter, async (request, response) => {
     response.set('Cache-Control', 'no-store');
     try {
         const attachment = await fetchDiscordAttachment(request.body?.url);
@@ -140,7 +151,9 @@ router.post('/discord-import/fetch', async (request, response) => {
     } catch (error) {
         const status = error instanceof DiscordImportFetchError ? error.status : 500;
         if (status >= 500) console.warn('Discord attachment fetch failed:', error?.message || error);
-        return response.status(status).send(String(error?.message || error));
+        return response.status(status).send(
+            error instanceof DiscordImportFetchError ? error.message : publicError(error, 'Discord 附件下载失败'),
+        );
     }
 });
 
@@ -318,14 +331,30 @@ function getImageFilePath(request, fileName) {
 router.post('/stories/list', (request, response) => {
     try {
         const directory = ensureStoriesDirectory(request);
+        // 只读取最近修改的 200 个故事文件，避免海量故事把响应撑爆。
         const files = fs.readdirSync(directory)
             .filter(file => file.endsWith('.json'))
-            .sort();
+            .map((file) => {
+                try {
+                    return { file, mtimeMs: fs.statSync(path.join(directory, file)).mtimeMs };
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.mtimeMs - a.mtimeMs)
+            .slice(0, STORY_LIST_MAX_STORIES)
+            .map(entry => entry.file);
         const stories = [];
 
         for (const file of files) {
             try {
-                stories.push(readStoryFile(path.join(directory, file), path.basename(file, '.json')));
+                const story = readStoryFile(path.join(directory, file), path.basename(file, '.json'));
+                // 超长封面（内联 data URL）不进列表响应，SPA 会自动回退到占位图。
+                if (String(story.coverImage || '').length > STORY_LIST_COVER_IMAGE_MAX_LENGTH) {
+                    story.coverImage = '';
+                }
+                stories.push(story);
             } catch (error) {
                 console.warn(`Failed to read AIBAR story ${file}:`, error);
             }
@@ -348,7 +377,7 @@ router.post('/stories/get', (request, response) => {
         return response.send(readStoryFile(filePath, id));
     } catch (error) {
         console.error(error);
-        return response.status(400).send(String(error.message || error));
+        return response.status(400).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -365,11 +394,19 @@ router.post('/stories/save', (request, response) => {
 
         const story = normalizeStory(incoming, existing);
         const { filePath } = getStoryPath(request, story.id);
+        // 新建故事时检查每用户上限；更新已有故事始终允许。
+        if (!fs.existsSync(filePath)) {
+            const directory = ensureStoriesDirectory(request);
+            const storyCount = fs.readdirSync(directory).filter(file => file.endsWith('.json')).length;
+            if (storyCount >= USER_STORY_MAX_COUNT) {
+                return response.status(400).send(`故事数量已达到 ${USER_STORY_MAX_COUNT} 个上限，请先删除旧故事`);
+            }
+        }
         writeFileSyncAtomic(filePath, JSON.stringify(story, null, 4), 'utf8');
         return response.send(story);
     } catch (error) {
         console.error(error);
-        return response.status(error instanceof AibarImageError ? error.status : 400).send(String(error.message || error));
+        return response.status(error instanceof AibarImageError ? error.status : 400).send(publicError(error, '故事保存失败'));
     }
 });
 
@@ -383,7 +420,7 @@ router.post('/stories/delete', (request, response) => {
         return response.sendStatus(200);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(String(error.message || error));
+        return response.status(400).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -402,14 +439,19 @@ router.post('/images/list', (request, response) => {
         return response.send(images);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(String(error.message || error));
+        return response.status(400).send(publicError(error, '请求处理失败'));
     }
 });
 
-router.post('/images/save', (request, response) => {
+router.post('/images/save', imageSaveLimiter, (request, response) => {
     try {
         const { buffer, format } = parseImageData(request.body.image, request.body.format);
         const id = normalizeImageId(request.body.id);
+        // 新图片受每用户数量上限约束；覆盖已有编号的图片始终允许。
+        const existingImages = readImageIndex(request);
+        if (existingImages.length >= USER_IMAGE_MAX_COUNT && !existingImages.some(image => image.id === id)) {
+            return response.status(400).send(`图片数量已达到 ${USER_IMAGE_MAX_COUNT} 张上限，请先删除旧图片`);
+        }
         const fileName = `${id}.${format}`;
         const { filePath } = getImageFilePath(request, fileName);
         writeFileSyncAtomic(filePath, buffer);
@@ -432,13 +474,13 @@ router.post('/images/save', (request, response) => {
             createdAt: now,
         };
 
-        const images = readImageIndex(request).filter(image => image.id !== id);
+        const images = existingImages.filter(image => image.id !== id);
         images.push(asset);
         writeImageIndex(request, images);
         return response.send(asset);
     } catch (error) {
         console.error(error);
-        return response.status(error instanceof AibarImageError ? error.status : 400).send(String(error.message || error));
+        return response.status(error instanceof AibarImageError ? error.status : 400).send(publicError(error, '图片保存失败'));
     }
 });
 
@@ -458,7 +500,7 @@ router.post('/images/delete', (request, response) => {
         return response.sendStatus(200);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(String(error.message || error));
+        return response.status(400).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -474,6 +516,6 @@ router.get('/images/file/:fileName', (request, response) => {
         return response.sendFile(filePath);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(String(error.message || error));
+        return response.status(400).send(publicError(error, '请求处理失败'));
     }
 });

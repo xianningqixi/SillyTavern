@@ -203,7 +203,7 @@ export function setupPrivateEndpoints(app, cliArgs = globalThis.COMMAND_LINE_ARG
     app.use('/api/translate', legacyProviderGuard, translateRouter);
     app.use('/api/extra/classify', classifyRouter);
     app.use('/api/extra/caption', captionRouter);
-    app.use('/api/search', searchRouter);
+    app.use('/api/search', legacyProviderGuard, searchRouter);
     app.use('/api/backends/text-completions', legacyProviderGuard, textCompletionsRouter);
     app.use('/api/openrouter', legacyProviderGuard, openRouterRouter);
     app.use('/api/nanogpt', legacyProviderGuard, nanogptRouter);

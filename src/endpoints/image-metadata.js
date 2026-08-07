@@ -40,7 +40,7 @@ export const METADATA_FILE = 'image-metadata.json';
 /** @type {Record<string, number[]>} */
 export const thumbnailDimensions = {
     'bg': getConfigValue('thumbnails.dimensions.bg', [160, 90]),
-    'avatar': getConfigValue('thumbnails.dimensions.avatar', [96, 144]),
+    'avatar': getConfigValue('thumbnails.dimensions.avatar', [240, 360]),
     'persona': getConfigValue('thumbnails.dimensions.persona', [96, 144]),
 };
 
