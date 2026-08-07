@@ -168,6 +168,7 @@ const saveStory = getRouteHandler(aibarRouter, '/stories/save');
 const listWorks = getRouteHandler(communityRouter, '/works/list');
 const getWork = getRouteHandler(communityRouter, '/works/get');
 const publishWork = getRouteHandler(communityRouter, '/works/publish');
+const publishDiscordWork = getRouteHandler(communityRouter, '/works/publish-discord');
 const registerDiscordBatch = getRouteHandler(communityRouter, '/admin/discord-import/batches');
 const uploadDiscordItem = getRouteHandler(communityRouter, '/admin/discord-import/items/:itemId/upload');
 const publishDiscordItem = getRouteHandler(communityRouter, '/admin/discord-import/items/:itemId/publish');
@@ -1228,6 +1229,54 @@ test('Discord imports store trusted hashes, publish versions, and deduplicate cr
     assert.equal(duplicatePublish.body.item.workId, firstWorkId);
     assert.equal(duplicatePublish.body.item.workVersionId, firstVersionId);
     assert.equal(getCommunityDb().prepare('SELECT COUNT(*) AS count FROM works WHERE id = ?').get(firstWorkId).count, 1);
+});
+
+test('manual Discord publication creates one public work and deduplicates by server-side PNG hash', async () => {
+    const firstSource = {
+        guildId: DISCORD_TEST_GUILD_ID,
+        channelId: '1478601254312874024',
+        threadId: '1478612237869519301',
+        cardId: '1478612237869519301',
+        sourceUrl: `https://discord.com/channels/${DISCORD_TEST_GUILD_ID}/1478612237869519301`,
+        title: 'Manual Discord Public Work',
+        authorName: 'Discord Author',
+        tags: ['中文', '剧情'],
+    };
+    const sourceBytes = fs.readFileSync(path.join(directories.characters, characterAvatar));
+    const trustedHash = crypto.createHash('sha256').update(sourceBytes).digest('hex');
+
+    const firstPublish = await invokeRoute(publishDiscordWork, {
+        sourceId: characterAvatar,
+        source: firstSource,
+    });
+    assert.equal(firstPublish.status, 201);
+    assert.equal(firstPublish.body.status, 'published');
+    assert.equal(firstPublish.body.work.status, 'published');
+    assert.equal(firstPublish.body.work.versionNumber, 1);
+    const firstWorkId = firstPublish.body.work.id;
+    const firstSnapshot = JSON.parse(getCommunityDb().prepare(`
+        SELECT payload_json FROM work_versions WHERE id = ?
+    `).get(firstPublish.body.versionId).payload_json);
+    assert.equal(firstSnapshot.externalSource.provider, 'discord');
+    assert.equal(firstSnapshot.externalSource.fileSha256, trustedHash);
+    assert.equal(firstSnapshot.externalSource.channelId, firstSource.channelId);
+
+    const duplicatePublish = await invokeRoute(publishDiscordWork, {
+        sourceId: characterAvatar,
+        source: {
+            ...firstSource,
+            threadId: '1478612237869519302',
+            cardId: '1478612237869519302',
+            sourceUrl: `https://discord.com/channels/${DISCORD_TEST_GUILD_ID}/1478612237869519302`,
+            title: 'Mirrored Manual Discord Work',
+        },
+    });
+    assert.equal(duplicatePublish.status, 200);
+    assert.equal(duplicatePublish.body.status, 'duplicate');
+    assert.equal(duplicatePublish.body.work.id, firstWorkId);
+    assert.equal(getCommunityDb().prepare(`
+        SELECT COUNT(*) AS count FROM work_versions WHERE work_id = ?
+    `).get(firstWorkId).count, 1);
 });
 
 test('story publication rejects missing and invalid MOD snapshots', async () => {

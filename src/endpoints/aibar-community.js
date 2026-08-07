@@ -41,6 +41,11 @@ const APPROVAL_CLAIM_PREFIX = 'claim:';
 const APPROVAL_CLAIM_TTL_MS = 10 * 60 * 1000;
 const DISCORD_IMPORT_GUILD_ID = '1380075940285124724';
 const DISCORD_IMPORT_CHANNEL_ID = '1478612237869519021';
+const DISCORD_PUBLIC_CHANNEL_IDS = new Set([
+    '1478601254312874024',
+    '1478601664838766723',
+    DISCORD_IMPORT_CHANNEL_ID,
+]);
 const DISCORD_IMPORT_TIMEZONE = 'Asia/Shanghai';
 const DISCORD_IMPORT_MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
 const DISCORD_IMPORT_MAX_CARDS = 200;
@@ -120,6 +125,62 @@ function validateDiscordThreadUrl(value, threadId, cardId) {
         throw new Error('sourceUrl 与角色卡帖子不匹配');
     }
     return sourceUrl;
+}
+
+function normalizeDiscordPublicSource(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new CommunityPublishError('Discord 来源信息无效');
+    }
+    const allowedKeys = new Set([
+        'guildId', 'channelId', 'threadId', 'cardId', 'sourceUrl', 'title', 'authorName', 'tags',
+    ]);
+    const unsupported = Object.keys(value).find(key => !allowedKeys.has(key));
+    if (unsupported) throw new CommunityPublishError(`Discord 来源字段无效：${unsupported}`);
+
+    const guildId = discordSnowflake(value.guildId, 'guildId');
+    const channelId = discordSnowflake(value.channelId, 'channelId');
+    const threadId = discordSnowflake(value.threadId, 'threadId');
+    const cardId = discordSnowflake(value.cardId, 'cardId');
+    if (guildId !== DISCORD_IMPORT_GUILD_ID || !DISCORD_PUBLIC_CHANNEL_IDS.has(channelId)) {
+        throw new CommunityPublishError('Discord 来源不在允许范围内');
+    }
+
+    const sourceUrl = discordImportText(value.sourceUrl, 'sourceUrl', 2048);
+    let parsed;
+    try {
+        parsed = new URL(sourceUrl);
+    } catch {
+        throw new CommunityPublishError('sourceUrl 无效');
+    }
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const channelRef = segments[2];
+    const messageRef = segments[3];
+    const matchesThread = channelRef === threadId || messageRef === threadId || messageRef === cardId;
+    if (
+        parsed.protocol !== 'https:'
+        || parsed.hostname.toLowerCase() !== 'discord.com'
+        || parsed.port
+        || parsed.username
+        || parsed.password
+        || parsed.search
+        || parsed.hash
+        || (segments.length !== 3 && segments.length !== 4)
+        || segments[0] !== 'channels'
+        || segments[1] !== guildId
+        || !matchesThread
+        || (channelRef !== threadId && channelRef !== channelId)
+    ) throw new CommunityPublishError('sourceUrl 与 Discord 来源帖子不匹配');
+
+    return {
+        guildId,
+        channelId,
+        threadId,
+        cardId,
+        sourceUrl,
+        title: discordImportText(value.title, 'title', 120),
+        authorName: discordImportText(value.authorName || '', 'authorName', 120, { allowEmpty: true }),
+        tags: discordImportTags(value.tags || [], 'tags', 16),
+    };
 }
 
 function normalizeDiscordImportManifest(value) {
@@ -1164,7 +1225,7 @@ async function publishCommunitySource(request, input, options = {}) {
     try {
         const sourceType = String(input.sourceType || '');
         const sourceId = String(input.sourceId || '');
-        const source = await capturePrivateSource(request, sourceType, sourceId);
+        const source = options.source || await capturePrivateSource(request, sourceType, sourceId);
         const db = getCommunityDb();
         const requestedWorkId = String(input.workId || '').trim();
         const existing = requestedWorkId ? db.prepare('SELECT * FROM works WHERE id = ?').get(requestedWorkId) : null;
@@ -1295,6 +1356,83 @@ router.post('/works/publish', async (request, response) => {
         return response.status(result.created ? 201 : 200).json(result.work);
     } catch (error) {
         console.error('AIBAR publish failed:', error);
+        const status = error instanceof CommunityPublishError ? error.status : 400;
+        return response.status(status).json({ error: String(error.message || error) });
+    }
+});
+
+router.post('/works/publish-discord', requireAdminMiddleware, async (request, response) => {
+    try {
+        const sourceId = String(request.body?.sourceId || '');
+        const discordSource = normalizeDiscordPublicSource(request.body?.source);
+        const source = await capturePrivateSource(request, 'character', sourceId);
+        const fileSha256 = crypto.createHash('sha256').update(fs.readFileSync(source.characterPath)).digest('hex');
+        const db = getCommunityDb();
+
+        const duplicate = db.prepare(`
+            SELECT w.id AS work_id, v.id AS version_id
+            FROM work_versions v
+            JOIN works w ON w.id = v.work_id
+            WHERE w.type = 'character' AND w.status = 'published'
+              AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
+              AND json_extract(v.payload_json, '$.externalSource.fileSha256') = ?
+            ORDER BY v.created_at DESC
+            LIMIT 1
+        `).get(fileSha256);
+        if (duplicate) {
+            const row = getWorkRow(duplicate.work_id);
+            if (!row) throw new CommunityPublishError('重复作品已不可见，请重试发布', 409);
+            return response.json({
+                status: 'duplicate',
+                versionId: duplicate.version_id,
+                work: workStats(row, request.user.profile.handle, true),
+            });
+        }
+
+        const previous = db.prepare(`
+            SELECT w.id AS work_id
+            FROM work_versions v
+            JOIN works w ON w.id = v.work_id
+            WHERE w.type = 'character' AND w.author_handle = ?
+              AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
+              AND json_extract(v.payload_json, '$.externalSource.guildId') = ?
+              AND json_extract(v.payload_json, '$.externalSource.channelId') = ?
+              AND json_extract(v.payload_json, '$.externalSource.threadId') = ?
+            ORDER BY v.created_at DESC
+            LIMIT 1
+        `).get(
+            request.user.profile.handle,
+            discordSource.guildId,
+            discordSource.channelId,
+            discordSource.threadId,
+        );
+        const externalSource = {
+            provider: 'discord',
+            guildId: discordSource.guildId,
+            channelId: discordSource.channelId,
+            threadId: discordSource.threadId,
+            cardId: discordSource.cardId,
+            sourceUrl: discordSource.sourceUrl,
+            authorName: discordSource.authorName,
+            fileName: path.basename(source.characterPath),
+            fileSha256,
+            importedAt: nowIso(),
+        };
+        const result = await publishCommunitySource(request, {
+            sourceType: 'character',
+            sourceId,
+            workId: previous?.work_id || '',
+            title: discordSource.title,
+            tags: discordSource.tags,
+            versionNote: previous ? 'Discord 角色卡更新' : 'Discord 角色卡发布',
+        }, { source, externalSource });
+        return response.status(result.created ? 201 : 200).json({
+            status: 'published',
+            versionId: result.work.latestVersionId,
+            work: result.work,
+        });
+    } catch (error) {
+        console.error('AIBAR Discord public publish failed:', error);
         const status = error instanceof CommunityPublishError ? error.status : 400;
         return response.status(status).json({ error: String(error.message || error) });
     }
