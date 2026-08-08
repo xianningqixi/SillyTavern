@@ -1167,6 +1167,33 @@ router.post('/works/list', (request, response) => {
     }
 });
 
+// 已发布作品最新版本的标签聚合：社区页标签筛选 chips 的数据源
+router.post('/works/tags', (request, response) => {
+    try {
+        const db = getCommunityDb();
+        const type = ['character', 'story', 'mod'].includes(request.body.type) ? request.body.type : '';
+        const params = [];
+        let where = 'w.status = \'published\'';
+        if (type) {
+            where += ' AND w.type = ?';
+            params.push(type);
+        }
+        const tags = db.prepare(`
+            SELECT wt.tag AS tag, COUNT(*) AS count
+            FROM work_tags wt
+            JOIN works w ON w.latest_version_id = wt.version_id
+            WHERE ${where}
+            GROUP BY wt.tag
+            ORDER BY count DESC, wt.tag ASC
+            LIMIT 60
+        `).all(...params);
+        return response.json({ tags });
+    } catch (error) {
+        console.error('AIBAR work tags failed:', error);
+        return response.status(400).json({ error: publicError(error, '请求处理失败') });
+    }
+});
+
 router.post('/works/get', (request, response) => {
     try {
         const db = getCommunityDb();

@@ -1808,3 +1808,20 @@ test('the discord batch publish route is admin-gated behind a per-user rate limi
     assert.ok(layer.route.stack.length >= 3, 'admin middleware + rate limiter + handler');
     assert.equal(layer.route.stack[1].handle.name, 'userRateLimit');
 });
+
+test('work tags aggregate published latest-version tags for the filter chips', async () => {
+    const worksTags = getRouteHandler(communityRouter, '/works/tags');
+    const all = await invokeRoute(worksTags, {});
+    assert.equal(all.status, 200);
+    assert.ok(Array.isArray(all.body.tags));
+    for (const entry of all.body.tags) {
+        assert.equal(typeof entry.tag, 'string');
+        assert.ok(Number.isInteger(entry.count) && entry.count >= 1);
+    }
+    // 类型过滤只接受白名单值；非法类型按“全部”处理而不是报错
+    const typed = await invokeRoute(worksTags, { type: 'character' });
+    assert.equal(typed.status, 200);
+    const bogus = await invokeRoute(worksTags, { type: 'DROP TABLE' });
+    assert.equal(bogus.status, 200);
+    assert.deepEqual(bogus.body.tags, all.body.tags);
+});
