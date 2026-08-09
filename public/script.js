@@ -688,6 +688,109 @@ export async function pingServer() {
     }
 }
 
+const AIBAR_ST_COMPAT_APPROVAL_PREFIX = 'aibar.st-compat.approval.';
+
+function isSafeAibarReturnPath(value) {
+    return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//');
+}
+
+function renderAibarCompatibilityBanner({ returnTo = '/aibar/', blocked = false, detail = '' } = {}) {
+    document.body.classList.add('aibar-compat-mode');
+    document.getElementById('aibar-compat-banner')?.remove();
+
+    const banner = document.createElement('div');
+    banner.id = 'aibar-compat-banner';
+    banner.dataset.state = blocked ? 'blocked' : 'ready';
+
+    const copy = document.createElement('div');
+    copy.className = 'aibar-compat-copy';
+    const title = document.createElement('span');
+    title.className = 'aibar-compat-title';
+    title.textContent = blocked ? 'ST 兼容模式未启动' : 'ST 兼容模式';
+    const description = document.createElement('span');
+    description.className = 'aibar-compat-detail';
+    description.textContent = detail;
+    copy.append(title, description);
+
+    const back = document.createElement('button');
+    back.type = 'button';
+    back.className = 'aibar-compat-back';
+    back.textContent = '返回 AIBAR';
+    back.addEventListener('click', () => window.location.assign(isSafeAibarReturnPath(returnTo) ? returnTo : '/aibar/'));
+
+    banner.append(copy, back);
+    document.body.appendChild(banner);
+}
+
+function readAibarCompatibilityApproval() {
+    if (!window.location.pathname.startsWith('/st-compat')) return null;
+    const nonce = new URLSearchParams(window.location.search).get('aibar_approval');
+    if (!nonce || !/^[a-z0-9-]{8,128}$/i.test(nonce)) return null;
+
+    const key = `${AIBAR_ST_COMPAT_APPROVAL_PREFIX}${nonce}`;
+    const raw = sessionStorage.getItem(key);
+    sessionStorage.removeItem(key);
+    if (!raw) return null;
+
+    try {
+        const approval = JSON.parse(raw);
+        if (
+            approval?.version !== 1
+            || typeof approval.avatar !== 'string'
+            || !approval.avatar.toLowerCase().endsWith('.png')
+            || typeof approval.chat !== 'string'
+            || !approval.chat
+            || approval.chat.length > 240
+            || /[\\/]/.test(approval.chat)
+            || !isSafeAibarReturnPath(approval.returnTo)
+            || !Number.isFinite(approval.expiresAt)
+            || approval.expiresAt < Date.now()
+        ) {
+            return null;
+        }
+        return approval;
+    } catch {
+        return null;
+    }
+}
+
+async function applyAibarCompatibilityHandoff() {
+    if (!window.location.pathname.startsWith('/st-compat')) return;
+
+    const approval = readAibarCompatibilityApproval();
+    if (!approval) {
+        setActiveCharacter(null);
+        setActiveGroup(null);
+        renderAibarCompatibilityBanner({
+            blocked: true,
+            detail: '请从 AIBAR 的角色页面确认后进入。',
+        });
+        return;
+    }
+
+    const characterId = characters.findIndex(character => character.avatar === approval.avatar);
+    if (characterId < 0) {
+        setActiveCharacter(null);
+        setActiveGroup(null);
+        renderAibarCompatibilityBanner({
+            blocked: true,
+            returnTo: approval.returnTo,
+            detail: '角色不存在或已被删除。',
+        });
+        return;
+    }
+
+    characters[characterId].chat = approval.chat;
+    await selectCharacterById(characterId, { switchMenu: false });
+    setActiveCharacter(characters[characterId]);
+    saveSettingsDebounced();
+    renderAibarCompatibilityBanner({
+        returnTo: approval.returnTo,
+        detail: `正在运行「${characters[characterId].name}」`,
+    });
+    window.history.replaceState({}, '', '/st-compat/');
+}
+
 //MARK: firstLoadInit
 async function firstLoadInit() {
     try {
@@ -755,6 +858,7 @@ async function firstLoadInit() {
     initBookmarks();
     await getUserAvatars(true, user_avatar);
     await getCharacters();
+    await applyAibarCompatibilityHandoff();
     await getBackgrounds();
     await initTokenizers();
     initBackgrounds();

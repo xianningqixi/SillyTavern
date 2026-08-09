@@ -213,6 +213,20 @@ if (!cliArgs.disableCsrf) {
 }
 
 // Static files
+// AIBAR's complex-card runtime reuses the native ST frontend. The dedicated
+// entry point keeps production proxies from exposing `/` while preserving the
+// same authenticated account and API origin.
+app.get(['/st-compat', '/st-compat/'], cacheBuster.middleware, (request, response) => {
+    if (shouldRedirectToLogin(request)) {
+        const query = request.url.split('?')[1];
+        const redirectUrl = query ? `/login?${query}` : '/login';
+        return response.redirect(redirectUrl);
+    }
+
+    response.setHeader('Cache-Control', 'no-store');
+    return response.sendFile('index.html', { root: path.join(serverDirectory, 'public') });
+});
+
 // Host index page
 app.get('/', cacheBuster.middleware, (request, response) => {
     if (shouldRedirectToLogin(request)) {

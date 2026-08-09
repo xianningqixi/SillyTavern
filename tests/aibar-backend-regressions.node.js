@@ -84,6 +84,7 @@ const {
     untrackActiveReservation,
     validateGenerationMessages,
 } = modelsModule;
+const { charaFormatData } = await import('../src/endpoints/characters.js');
 const { normalizeRegistrationHandle, registrationRateLimitKey } = publicModule;
 
 const settingsPath = path.join(userRoot, 'settings.json');
@@ -167,6 +168,59 @@ test('strict chat reads distinguish a missing chat from malformed JSONL', () => 
 
     fs.writeFileSync(chatPath, '{"chat_metadata":{}}\nnot-json', 'utf8');
     assert.throws(() => getChatDataStrict(chatPath), SyntaxError);
+});
+
+test('editing a Tavern Card V3 preserves its spec and executable extension payload', () => {
+    const original = {
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        vendor_extension: { keep: true },
+        data: {
+            name: 'Complex card',
+            description: 'before',
+            personality: '',
+            scenario: '',
+            first_mes: 'start',
+            mes_example: '',
+            creator_notes: '',
+            system_prompt: '',
+            post_history_instructions: '',
+            tags: [],
+            creator: '',
+            character_version: '1',
+            alternate_greetings: [],
+            character_book: { entries: [{ content: 'state' }] },
+            extensions: {
+                tavern_helper: { scripts: [{ name: 'MVU', content: 'initialize()' }] },
+                regex_scripts: [{ script_name: 'render' }],
+            },
+        },
+    };
+
+    const edited = charaFormatData({
+        json_data: JSON.stringify(original),
+        ch_name: 'Complex card',
+        description: 'after',
+        personality: '',
+        scenario: '',
+        first_mes: 'start',
+        mes_example: '',
+        creator_notes: '',
+        system_prompt: '',
+        post_history_instructions: '',
+        tags: [],
+        creator: '',
+        character_version: '2',
+        alternate_greetings: [],
+    }, directories);
+
+    assert.equal(edited.spec, 'chara_card_v3');
+    assert.equal(edited.spec_version, '3.0');
+    assert.equal(edited.data.description, 'after');
+    assert.deepEqual(edited.data.character_book, original.data.character_book);
+    assert.deepEqual(edited.data.extensions.tavern_helper, original.data.extensions.tavern_helper);
+    assert.deepEqual(edited.data.extensions.regex_scripts, original.data.extensions.regex_scripts);
+    assert.deepEqual(edited.vendor_extension, { keep: true });
 });
 const registerUser = getRouteHandler(publicModule.router, '/register');
 const saveImage = getRouteHandler(aibarRouter, '/images/save');

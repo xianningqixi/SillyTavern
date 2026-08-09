@@ -563,7 +563,7 @@ function readFromV2(char) {
  * @param {import('../users.js').UserDirectoryList} directories User directories
  * @returns
  */
-function charaFormatData(data, directories) {
+export function charaFormatData(data, directories) {
     // This is supposed to save all the foreign keys that ST doesn't care about
     const char = tryParse(data.json_data) || {};
 
@@ -593,9 +593,13 @@ function charaFormatData(data, directories) {
     _.set(char, 'fav', data.fav == 'true');
     _.set(char, 'tags', typeof data.tags == 'string' ? (data.tags.split(',').map(x => x.trim()).filter(x => x)) : data.tags || []);
 
-    // Spec V2 fields
-    _.set(char, 'spec', 'chara_card_v2');
-    _.set(char, 'spec_version', '2.0');
+    // New cards use V2 for broad compatibility. Existing V3 cards must keep
+    // their declared spec so editing ordinary fields does not downgrade or
+    // discard extension data that only the full ST runtime understands.
+    if (char.spec !== 'chara_card_v3') {
+        _.set(char, 'spec', 'chara_card_v2');
+        _.set(char, 'spec_version', '2.0');
+    }
     _.set(char, 'data.name', data.ch_name);
     _.set(char, 'data.description', data.description || '');
     _.set(char, 'data.personality', data.personality || '');

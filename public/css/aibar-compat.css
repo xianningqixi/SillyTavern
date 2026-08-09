@@ -1,0 +1,70 @@
+body.aibar-compat-mode #aibar-compat-banner {
+    position: fixed;
+    z-index: 10050;
+    top: max(8px, env(safe-area-inset-top));
+    left: 50%;
+    display: flex;
+    width: min(680px, calc(100dvw - 24px));
+    min-height: 38px;
+    transform: translateX(-50%);
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 8px 7px 12px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 75%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 94%, black 6%);
+    box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+    color: var(--SmartThemeBodyColor);
+    font: 13px/1.35 var(--mainFontFamily);
+    backdrop-filter: blur(14px);
+}
+
+body.aibar-compat-mode #aibar-compat-banner[data-state="blocked"] {
+    border-color: rgb(239 68 68 / 60%);
+}
+
+#aibar-compat-banner .aibar-compat-copy {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#aibar-compat-banner .aibar-compat-title {
+    font-weight: 700;
+}
+
+#aibar-compat-banner .aibar-compat-detail {
+    margin-left: 6px;
+    opacity: 0.72;
+}
+
+#aibar-compat-banner .aibar-compat-back {
+    flex: 0 0 auto;
+    min-height: 30px;
+    padding: 4px 10px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor) 25%, transparent);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor) 10%, transparent);
+    color: inherit;
+    cursor: pointer;
+}
+
+#aibar-compat-banner .aibar-compat-back:hover {
+    background: color-mix(in srgb, var(--SmartThemeBodyColor) 18%, transparent);
+}
+
+@media (max-width: 520px) {
+    body.aibar-compat-mode #aibar-compat-banner {
+        align-items: stretch;
+    }
+
+    #aibar-compat-banner .aibar-compat-copy {
+        white-space: normal;
+    }
+
+    #aibar-compat-banner .aibar-compat-detail {
+        display: none;
+    }
+}
