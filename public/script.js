@@ -9,7 +9,7 @@ import {
     initLibraryShims,
     default as libs,
     lodash,
-} from './lib.js?v=aibar-compat-1';
+} from './lib.js';
 
 import { humanizedDateTime, favsToHotswap, getMessageTimeStamp, dragElement, isMobile, initRossMods } from './scripts/RossAscends-mods.js';
 import { userStatsHandler, statMesProcess, initStats } from './scripts/stats.js';
