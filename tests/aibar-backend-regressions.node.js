@@ -222,6 +222,14 @@ test('editing a Tavern Card V3 preserves its spec and executable extension paylo
     assert.deepEqual(edited.data.extensions.regex_scripts, original.data.extensions.regex_scripts);
     assert.deepEqual(edited.vendor_extension, { keep: true });
 });
+
+test('the ST compatibility entry point cache-busts its root modules', () => {
+    const indexHtml = fs.readFileSync(path.resolve('public/index.html'), 'utf8');
+    const clientScript = fs.readFileSync(path.resolve('public/script.js'), 'utf8');
+
+    assert.match(indexHtml, /src="script\.js\?v=aibar-compat-1"/);
+    assert.match(clientScript, /from '\.\/lib\.js\?v=aibar-compat-1';/);
+});
 const registerUser = getRouteHandler(publicModule.router, '/register');
 const saveImage = getRouteHandler(aibarRouter, '/images/save');
 const saveStory = getRouteHandler(aibarRouter, '/stories/save');
