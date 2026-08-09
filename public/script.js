@@ -722,14 +722,14 @@ function renderAibarCompatibilityBanner({ returnTo = '/aibar/', blocked = false,
     document.body.appendChild(banner);
 }
 
-function readAibarCompatibilityApproval() {
+function getAibarCompatibilityApproval({ consume = false } = {}) {
     if (!window.location.pathname.startsWith('/st-compat')) return null;
     const nonce = new URLSearchParams(window.location.search).get('aibar_approval');
     if (!nonce || !/^[a-z0-9-]{8,128}$/i.test(nonce)) return null;
 
     const key = `${AIBAR_ST_COMPAT_APPROVAL_PREFIX}${nonce}`;
     const raw = sessionStorage.getItem(key);
-    sessionStorage.removeItem(key);
+    if (consume) sessionStorage.removeItem(key);
     if (!raw) return null;
 
     try {
@@ -752,6 +752,14 @@ function readAibarCompatibilityApproval() {
     } catch {
         return null;
     }
+}
+
+function hasValidAibarCompatibilityApproval() {
+    return Boolean(getAibarCompatibilityApproval());
+}
+
+function readAibarCompatibilityApproval() {
+    return getAibarCompatibilityApproval({ consume: true });
 }
 
 async function applyAibarCompatibilityHandoff() {
@@ -8081,7 +8089,7 @@ export async function getSettings(initLoaderHandle = null) {
 
         firstRun = !!settings.firstRun;
 
-        if (firstRun) {
+        if (firstRun && !hasValidAibarCompatibilityApproval()) {
             await initLoaderHandle?.hide();
             await doOnboarding(user_avatar);
             firstRun = false;

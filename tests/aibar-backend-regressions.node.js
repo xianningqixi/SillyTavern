@@ -223,14 +223,16 @@ test('editing a Tavern Card V3 preserves its spec and executable extension paylo
     assert.deepEqual(edited.vendor_extension, { keep: true });
 });
 
-test('the ST compatibility entry point cache-busts the complete circular module graph', () => {
+test('the ST compatibility entry point cache-busts the module graph and bypasses onboarding only with approval', () => {
     const indexHtml = fs.readFileSync(path.resolve('public/index.html'), 'utf8');
     const clientScript = fs.readFileSync(path.resolve('public/script.js'), 'utf8');
 
-    assert.match(indexHtml, /"\/script\.js": "\/script\.js\?v=aibar-compat-2"/);
-    assert.match(indexHtml, /"\/lib\.js": "\/lib\.js\?v=aibar-compat-2"/);
-    assert.match(indexHtml, /src="script\.js\?v=aibar-compat-2"/);
+    assert.match(indexHtml, /"\/script\.js": "\/script\.js\?v=aibar-compat-3"/);
+    assert.match(indexHtml, /"\/lib\.js": "\/lib\.js\?v=aibar-compat-3"/);
+    assert.match(indexHtml, /src="script\.js\?v=aibar-compat-3"/);
     assert.match(clientScript, /from '\.\/lib\.js';/);
+    assert.match(clientScript, /if \(firstRun && !hasValidAibarCompatibilityApproval\(\)\)/);
+    assert.match(clientScript, /getAibarCompatibilityApproval\(\{ consume: true \}\)/);
 });
 const registerUser = getRouteHandler(publicModule.router, '/register');
 const saveImage = getRouteHandler(aibarRouter, '/images/save');
