@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { color, urlHostnameToIPv6, getConfigValue, getHasIP } from './util.js';
 
 // Express routers
-import { requireAdminMiddleware, router as userDataRouter } from './users.js';
+import { router as userDataRouter } from './users.js';
 import { router as usersPrivateRouter } from './endpoints/users-private.js';
 import { router as usersAdminRouter } from './endpoints/users-admin.js';
 import { router as movingUIRouter } from './endpoints/moving-ui.js';
@@ -53,8 +53,9 @@ import { router as imageMetadataRouter } from './endpoints/image-metadata.js';
 import { router as volcengineRouter } from './endpoints/volcengine.js';
 import { router as aibarRouter } from './endpoints/aibar.js';
 import { router as aibarCommunityRouter } from './endpoints/aibar-community.js';
-import { legacyProviderGuard, router as aibarModelsRouter, sharedModelGuard } from './endpoints/aibar-models.js';
+import { router as aibarModelsRouter } from './endpoints/aibar-models.js';
 import { router as aibarTelegramRouter } from './endpoints/aibar-telegram.js';
+import { applyAibarProviderGuards } from './aibar-guards.js';
 
 const AIBAR_USER_ACCOUNTS_ENABLED = getConfigValue('enableUserAccounts', false, 'boolean');
 
@@ -169,6 +170,8 @@ export function redirectDeprecatedEndpoints(app) {
  * @param {import('./command-line.js').CommandLineArguments} [cliArgs] The command-line arguments
  */
 export function setupPrivateEndpoints(app, cliArgs = globalThis.COMMAND_LINE_ARGS) {
+    // AIBAR 的权限 guard 必须先于上游 router 注册（见 aibar-guards.js 的说明）。
+    applyAibarProviderGuards(app);
     app.use('/', userDataRouter);
     app.use('/api/users', usersPrivateRouter);
     app.use('/api/users', usersAdminRouter);
@@ -182,9 +185,9 @@ export function setupPrivateEndpoints(app, cliArgs = globalThis.COMMAND_LINE_ARG
     app.use('/api/anthropic', anthropicRouter);
     app.use('/api/tokenizers', tokenizersRouter);
     app.use('/api/presets', presetsRouter);
-    app.use('/api/secrets', requireAdminMiddleware, secretsRouter);
+    app.use('/api/secrets', secretsRouter);
     app.use('/thumbnail', thumbnailRouter);
-    app.use('/api/novelai', legacyProviderGuard, novelAiRouter);
+    app.use('/api/novelai', novelAiRouter);
     app.use('/api/extensions', extensionsRouter);
     app.use('/api/assets', assetsRouter);
     app.use('/api/files', filesRouter);
@@ -197,23 +200,22 @@ export function setupPrivateEndpoints(app, cliArgs = globalThis.COMMAND_LINE_ARG
     app.use('/api/sprites', spritesRouter);
     app.use('/api/content', contentManagerRouter);
     app.use('/api/settings', settingsRouter);
-    app.use('/api/sd', legacyProviderGuard, stableDiffusionRouter);
-    app.use('/api/horde', legacyProviderGuard, hordeRouter);
+    app.use('/api/sd', stableDiffusionRouter);
+    app.use('/api/horde', hordeRouter);
     app.use('/api/vector', vectorsRouter);
-    app.use('/api/translate', legacyProviderGuard, translateRouter);
+    app.use('/api/translate', translateRouter);
     app.use('/api/extra/classify', classifyRouter);
     app.use('/api/extra/caption', captionRouter);
-    app.use('/api/search', legacyProviderGuard, searchRouter);
-    app.use('/api/backends/text-completions', legacyProviderGuard, textCompletionsRouter);
-    app.use('/api/openrouter', legacyProviderGuard, openRouterRouter);
-    app.use('/api/nanogpt', legacyProviderGuard, nanogptRouter);
-    app.use('/api/backends/kobold', legacyProviderGuard, koboldRouter);
-    app.use('/api/backends/chat-completions', sharedModelGuard);
+    app.use('/api/search', searchRouter);
+    app.use('/api/backends/text-completions', textCompletionsRouter);
+    app.use('/api/openrouter', openRouterRouter);
+    app.use('/api/nanogpt', nanogptRouter);
+    app.use('/api/backends/kobold', koboldRouter);
     app.use('/api/backends/chat-completions', chatCompletionsRouter);
-    app.use('/api/speech', legacyProviderGuard, speechRouter);
-    app.use('/api/azure', legacyProviderGuard, azureRouter);
-    app.use('/api/volcengine', legacyProviderGuard, volcengineRouter);
-    app.use('/api/minimax', legacyProviderGuard, minimaxRouter);
+    app.use('/api/speech', speechRouter);
+    app.use('/api/azure', azureRouter);
+    app.use('/api/volcengine', volcengineRouter);
+    app.use('/api/minimax', minimaxRouter);
     app.use('/api/data-maid', dataMaidRouter);
     app.use('/api/backups', backupsRouter);
     app.use('/api/image-metadata', imageMetadataRouter);

@@ -6,8 +6,10 @@ import express from 'express';
 import sanitize from 'sanitize-filename';
 import { sync as writeFileSyncAtomic } from 'write-file-atomic';
 
-import { publicError } from '../aibar-errors.js';
+import { publicError, publicErrorStatus } from '../aibar-errors.js';
 import { createUserRateLimiter } from '../aibar-rate-limit.js';
+import { SETTINGS_FILE } from '../constants.js';
+import { triggerAutoSave } from './settings.js';
 
 export const router = express.Router();
 
@@ -377,7 +379,7 @@ router.post('/stories/get', (request, response) => {
         return response.send(readStoryFile(filePath, id));
     } catch (error) {
         console.error(error);
-        return response.status(400).send(publicError(error, '请求处理失败'));
+        return response.status(publicErrorStatus(error)).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -420,7 +422,7 @@ router.post('/stories/delete', (request, response) => {
         return response.sendStatus(200);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(publicError(error, '请求处理失败'));
+        return response.status(publicErrorStatus(error)).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -439,7 +441,7 @@ router.post('/images/list', (request, response) => {
         return response.send(images);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(publicError(error, '请求处理失败'));
+        return response.status(publicErrorStatus(error)).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -500,7 +502,7 @@ router.post('/images/delete', (request, response) => {
         return response.sendStatus(200);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(publicError(error, '请求处理失败'));
+        return response.status(publicErrorStatus(error)).send(publicError(error, '请求处理失败'));
     }
 });
 
@@ -516,6 +518,59 @@ router.get('/images/file/:fileName', (request, response) => {
         return response.sendFile(filePath);
     } catch (error) {
         console.error(error);
-        return response.status(400).send(publicError(error, '请求处理失败'));
+        return response.status(publicErrorStatus(error)).send(publicError(error, '请求处理失败'));
+    }
+});
+
+// AIBAR 设置的合并写入上限：aibar 键下存放预设/人设/MOD 等，正常远小于该值。
+const AIBAR_SETTINGS_MAX_BYTES = 10 * 1024 * 1024;
+
+function readUserSettings(request) {
+    const filePath = path.join(request.user.directories.root, SETTINGS_FILE);
+    if (!fs.existsSync(filePath)) return { filePath, settings: {} };
+    try {
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        return { filePath, settings: (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {} };
+    } catch {
+        // settings.json 损坏时不阻塞 AIBAR 设置读写；上游 /api/settings/get 同样按空处理。
+        return { filePath, settings: {} };
+    }
+}
+
+function getAibarSection(settings) {
+    const section = settings.aibar;
+    return (section && typeof section === 'object' && !Array.isArray(section)) ? section : {};
+}
+
+router.post('/settings/get', (request, response) => {
+    try {
+        const { settings } = readUserSettings(request);
+        return response.json({ settings: getAibarSection(settings) });
+    } catch (error) {
+        console.error('AIBAR settings get failed:', error);
+        return response.status(500).json({ error: publicError(error, '设置读取失败') });
+    }
+});
+
+// 服务端在 aibar 键下做浅合并，前端只提交增量。这样 AIBAR 与 /st-compat 原生
+// 界面并发写设置时不会再发生整个 settings.json 的 last-writer-wins 互相覆盖。
+router.post('/settings/save', (request, response) => {
+    try {
+        const updates = request.body;
+        if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+            return response.status(400).json({ error: '设置更新必须是对象' });
+        }
+        const { filePath, settings } = readUserSettings(request);
+        const merged = { ...settings, aibar: { ...getAibarSection(settings), ...updates } };
+        const serialized = JSON.stringify(merged, null, 4);
+        if (serialized.length > AIBAR_SETTINGS_MAX_BYTES) {
+            return response.status(413).json({ error: '设置内容过大，无法保存' });
+        }
+        writeFileSyncAtomic(filePath, serialized, 'utf8');
+        triggerAutoSave(request.user.profile.handle);
+        return response.json({ settings: merged.aibar });
+    } catch (error) {
+        console.error('AIBAR settings save failed:', error);
+        return response.status(500).json({ error: publicError(error, '设置保存失败') });
     }
 });

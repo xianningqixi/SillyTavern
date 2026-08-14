@@ -31,3 +31,18 @@ export function publicError(error, fallback) {
     console.error('AIBAR internal error hidden from client:', error);
     return String(fallback);
 }
+
+/**
+ * 返回与 publicError 配套的 HTTP 状态码：显式 statusCode/status 优先；
+ * 内部错误（SQLite/文件系统/运行时异常）返回 500，让监控能区分参数错误与真实故障；
+ * 其余（校验类中文错误）按 fallbackStatus 处理。
+ * @param {any} error 捕获到的错误
+ * @param {number} [fallbackStatus] 校验类错误的默认状态码
+ * @returns {number} HTTP 状态码
+ */
+export function publicErrorStatus(error, fallbackStatus = 400) {
+    const status = Number(error?.statusCode ?? error?.status);
+    if (Number.isInteger(status) && status >= 400 && status <= 599) return status;
+    if (isInternalError(error)) return 500;
+    return fallbackStatus;
+}

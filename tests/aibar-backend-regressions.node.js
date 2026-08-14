@@ -46,7 +46,7 @@ const [
     modelsModule,
     publicModule,
     { router: communityRouter },
-    { router: aibarRouter },
+    { router: aibarRouter, validateDiscordAttachmentUrl },
     { getChatDataStrict },
     { isCsrfProtectionDisabled, setupPrivateEndpoints },
     { getClaudeApiConfig },
@@ -74,6 +74,7 @@ const {
     determineSettlementCharge,
     estimateInputTokens,
     estimateSettlementInputTokens,
+    isSupportedSharedModelSource,
     legacyProviderGuard,
     releaseStaleReservations,
     router: modelsRouter,
@@ -144,14 +145,26 @@ writeStory('valid-world-story', [], 'valid-world');
 fs.writeFileSync(path.join(directories.worlds, 'invalid-world.json'), '{ invalid json', 'utf8');
 fs.writeFileSync(path.join(directories.worlds, 'valid-world.json'), JSON.stringify({ entries: {} }), 'utf8');
 
+// aibar-community.js 通过 router.use() 合并 Discord 导入与注册审核子 router，路由层可能嵌套一层，这里递归查找。
+function findRouteLayer(router, routePath, method) {
+    for (const layer of router.stack) {
+        if (layer.route?.path === routePath && layer.route.methods[method]) return layer;
+        if (!layer.route && Array.isArray(layer.handle?.stack)) {
+            const nested = findRouteLayer(layer.handle, routePath, method);
+            if (nested) return nested;
+        }
+    }
+    return undefined;
+}
+
 function getRouteHandler(router, routePath) {
-    const routeLayer = router.stack.find(layer => layer.route?.path === routePath && layer.route.methods.post);
+    const routeLayer = findRouteLayer(router, routePath, 'post');
     assert.ok(routeLayer, `missing POST route ${routePath}`);
     return routeLayer.route.stack.at(-1).handle;
 }
 
 function getGetRouteHandler(router, routePath) {
-    const routeLayer = router.stack.find(layer => layer.route?.path === routePath && layer.route.methods.get);
+    const routeLayer = findRouteLayer(router, routePath, 'get');
     assert.ok(routeLayer, `missing GET route ${routePath}`);
     return routeLayer.route.stack.at(-1).handle;
 }
@@ -305,7 +318,7 @@ async function invokeRoute(
     handler,
     requestBody,
     profile = { handle: 'admin', name: 'Admin', admin: true },
-    { params = {}, file = undefined } = {},
+    { params = {}, file = undefined, userDirectories = directories } = {},
 ) {
     const request = {
         body: requestBody,
@@ -315,7 +328,7 @@ async function invokeRoute(
         socket: { remoteAddress: '127.0.0.1' },
         user: {
             profile,
-            directories,
+            directories: userDirectories,
         },
     };
     const result = { status: 200, body: null, headers: {} };
@@ -494,7 +507,9 @@ test('legacyProviderGuard blocks ordinary users and permits administrators', () 
     assert.equal(adminNextCalls, 1);
 });
 
-test('the translation proxy is mounted behind the legacy provider guard', async () => {
+test('every legacy provider route registers its guard before the upstream router', async () => {
+    const { AIBAR_LEGACY_PROVIDER_ROUTES } = await import('../src/aibar-guards.js');
+    const { requireAdminMiddleware } = await import('../src/users.js');
     const mounts = [];
     const fakeApp = {
         use(...args) {
@@ -503,9 +518,18 @@ test('the translation proxy is mounted behind the legacy provider guard', async 
     };
     await suppressExpectedErrors(() => setupPrivateEndpoints(fakeApp, { disableCsrf: false }));
 
-    const translateMounts = mounts.filter(mount => mount[0] === '/api/translate');
-    assert.equal(translateMounts.length, 1);
-    assert.ok(translateMounts[0].includes(legacyProviderGuard), '/api/translate must require an administrator');
+    // guard 由 applyAibarProviderGuards 预挂载，必须先于上游 router 注册；
+    // 两次挂载缺一（guard 丢失或 router 丢失）都意味着权限回归或路由失效。
+    for (const route of AIBAR_LEGACY_PROVIDER_ROUTES) {
+        const routeMounts = mounts.filter(mount => mount[0] === route);
+        assert.ok(routeMounts.length >= 2, `${route} must mount both the guard and the upstream router`);
+        assert.ok(routeMounts[0].includes(legacyProviderGuard), `${route} must be guarded before its router`);
+    }
+    const secretsMounts = mounts.filter(mount => mount[0] === '/api/secrets');
+    assert.ok(secretsMounts.length >= 2, '/api/secrets must mount both the admin guard and the upstream router');
+    assert.ok(secretsMounts[0].includes(requireAdminMiddleware), '/api/secrets must require an administrator');
+    const chatCompletionMounts = mounts.filter(mount => mount[0] === '/api/backends/chat-completions');
+    assert.ok(chatCompletionMounts[0].includes(sharedModelGuard), 'chat completions must sit behind sharedModelGuard');
 });
 
 test('AIBAR routers refuse to mount when CSRF protection is disabled', () => {
@@ -1068,6 +1092,8 @@ test('database migration closes historical duplicate active registrations', () =
     `);
     insert.run('legacy-a', '2026-01-01T00:00:00.000Z');
     insert.run('legacy-b', '2026-01-02T00:00:00.000Z');
+    // 模拟版本化迁移引入之前的历史库：游标拨回 2，重开时应重放去重迁移。
+    db.pragma('user_version = 2');
     db.close();
 
     db = createCommunityDatabase(databasePath);
@@ -1537,7 +1563,8 @@ test('launch database failure rolls back MOD and story filesystem changes', asyn
             db.exec('DROP TRIGGER fail_launch_insert');
         }
 
-        assert.equal(launched.status, 400, source.sourceType);
+        // 注入的 SQLite 故障属于内部错误，publicErrorStatus 应给出 500 而非 400。
+        assert.equal(launched.status, 500, source.sourceType);
         assert.deepEqual(snapshotTree(userRoot), beforeTree, source.sourceType);
         assert.equal(db.prepare('SELECT COUNT(*) AS count FROM launch_events').get().count, beforeLaunches, source.sourceType);
     }
@@ -1618,7 +1645,7 @@ test('expensive AIBAR routes are mounted behind per-user rate limiters', () => {
         [communityRouter, '/works/comments/add'],
     ];
     for (const [router, routePath] of guardedRoutes) {
-        const layer = router.stack.find(item => item.route?.path === routePath && item.route.methods.post);
+        const layer = findRouteLayer(router, routePath, 'post');
         assert.ok(layer, routePath);
         assert.ok(layer.route.stack.length >= 2, `${routePath} must have a middleware in front of the handler`);
         assert.equal(layer.route.stack[0].handle.name, 'userRateLimit', routePath);
@@ -1869,7 +1896,7 @@ test('discord batch publish orchestration caps fetch concurrency and isolates fa
 });
 
 test('the discord batch publish route is admin-gated behind a per-user rate limiter', () => {
-    const layer = communityRouter.stack.find(item => item.route?.path === '/works/publish-discord-batch' && item.route.methods.post);
+    const layer = findRouteLayer(communityRouter, '/works/publish-discord-batch', 'post');
     assert.ok(layer, 'batch route must exist');
     assert.ok(layer.route.stack.length >= 3, 'admin middleware + rate limiter + handler');
     assert.equal(layer.route.stack[1].handle.name, 'userRateLimit');
@@ -1890,4 +1917,383 @@ test('work tags aggregate published latest-version tags for the filter chips', a
     const bogus = await invokeRoute(worksTags, { type: 'DROP TABLE' });
     assert.equal(bogus.status, 200);
     assert.deepEqual(bogus.body.tags, all.body.tags);
+});
+
+const redeemPoints = getRouteHandler(modelsRouter, '/points/redeem');
+const createCreditCodes = getRouteHandler(modelsRouter, '/admin/points/codes/create');
+const getStory = getRouteHandler(aibarRouter, '/stories/get');
+const deleteStory = getRouteHandler(aibarRouter, '/stories/delete');
+const deleteImage = getRouteHandler(aibarRouter, '/images/delete');
+const getImageFile = getGetRouteHandler(aibarRouter, '/images/file/:fileName');
+const getAibarSettings = getRouteHandler(aibarRouter, '/settings/get');
+const saveAibarSettings = getRouteHandler(aibarRouter, '/settings/save');
+
+function insertCreditCode(id, code, amountMicros, { enabled = 1, expiresAt = null, redeemedBy = null } = {}) {
+    getCommunityDb().prepare(`
+        INSERT INTO credit_codes (
+            id, code_hash, label, amount_micros, created_by, enabled, expires_at,
+            redeemed_by, redeemed_at, created_at
+        ) VALUES (?, ?, '', ?, 'admin', ?, ?, ?, ?, ?)
+    `).run(
+        id, hashInviteCode(code), amountMicros, enabled, expiresAt,
+        redeemedBy, redeemedBy ? new Date().toISOString() : null, new Date().toISOString(),
+    );
+}
+
+function deleteRedemptionRows(cardIds, handles) {
+    const db = getCommunityDb();
+    for (const cardId of cardIds) db.prepare('DELETE FROM credit_codes WHERE id = ?').run(cardId);
+    for (const handle of handles) {
+        db.prepare('DELETE FROM point_ledger WHERE user_handle = ?').run(handle);
+        db.prepare('DELETE FROM point_accounts WHERE user_handle = ?').run(handle);
+    }
+}
+
+test('concurrent credit code redemption pays the amount out exactly once', async (t) => {
+    const cardId = 'redeem-race-card';
+    const code = 'REDEEM-RACE-CODE';
+    const amountMicros = 5_000_000;
+    const handles = ['redeem-race-a', 'redeem-race-b'];
+    insertCreditCode(cardId, code, amountMicros);
+    t.after(() => deleteRedemptionRows([cardId], handles));
+
+    const results = await Promise.all(handles.map(handle => invokeRoute(
+        redeemPoints,
+        { code },
+        { handle, name: handle, admin: false },
+    )));
+    assert.deepEqual(results.map(result => result.status).sort(), [200, 400]);
+    const loser = results.find(result => result.status === 400);
+    assert.match(String(loser.body.error), /兑换码/, 'the loser must get an explicit redemption error');
+
+    const db = getCommunityDb();
+    const winnerIndex = results.findIndex(result => result.status === 200);
+    assert.equal(
+        db.prepare('SELECT redeemed_by FROM credit_codes WHERE id = ?').get(cardId).redeemed_by,
+        handles[winnerIndex],
+        'the card must record exactly the winning handle',
+    );
+    // 两个账户的余额总增量必须恰好等于卡面额一次；输家的事务整体回滚，不能拿到任何积分。
+    assert.equal(db.prepare(`
+        SELECT COALESCE(SUM(balance_micros), 0) AS total FROM point_accounts WHERE user_handle IN (?, ?)
+    `).get(...handles).total, amountMicros);
+    assert.equal(db.prepare(`
+        SELECT COUNT(*) AS count FROM point_ledger WHERE reference_id = ?
+    `).get(cardId).count, 1);
+    assert.equal(results[winnerIndex].body.balance, amountMicros / 1_000_000);
+});
+
+test('credit code redemption rejects disabled, expired, and already redeemed cards', async (t) => {
+    const handle = 'redeem-reject-user';
+    const cases = [
+        ['redeem-disabled-card', 'REDEEM-DISABLED', { enabled: 0 }],
+        ['redeem-expired-card', 'REDEEM-EXPIRED', { expiresAt: '2000-01-01T00:00:00.000Z' }],
+        ['redeem-used-card', 'REDEEM-USED', { redeemedBy: 'someone-else' }],
+    ];
+    for (const [id, code, options] of cases) insertCreditCode(id, code, 1_000_000, options);
+    t.after(() => deleteRedemptionRows(cases.map(([id]) => id), [handle]));
+
+    for (const [id, code] of cases) {
+        const result = await invokeRoute(redeemPoints, { code }, { handle, name: 'Reject', admin: false });
+        assert.equal(result.status, 400, id);
+        assert.match(String(result.body.error), /兑换码/, id);
+    }
+    // 三次失败的兑换都不能给账户入账。
+    assert.equal(getCommunityDb().prepare(
+        'SELECT COALESCE(SUM(balance_micros), 0) AS total FROM point_accounts WHERE user_handle = ?',
+    ).get(handle).total, 0);
+});
+
+test('credit code redemption refuses to overflow the safe integer balance', async (t) => {
+    const handle = 'redeem-overflow-user';
+    const cardId = 'redeem-overflow-card';
+    const code = 'REDEEM-OVERFLOW';
+    const startingBalance = Number.MAX_SAFE_INTEGER - 1_000_000;
+    insertCreditCode(cardId, code, 2_000_000);
+    const db = getCommunityDb();
+    db.prepare(`
+        INSERT OR REPLACE INTO point_accounts (user_handle, balance_micros, held_micros, updated_at)
+        VALUES (?, ?, 0, ?)
+    `).run(handle, startingBalance, new Date().toISOString());
+    t.after(() => deleteRedemptionRows([cardId], [handle]));
+
+    const result = await invokeRoute(redeemPoints, { code }, { handle, name: 'Overflow', admin: false });
+    // Number.isSafeInteger 保护：超过安全整数上限的入账整体拒绝并回滚，卡片保持未兑换。
+    assert.equal(result.status, 400);
+    assert.match(String(result.body.error), /上限/);
+    assert.equal(
+        db.prepare('SELECT balance_micros FROM point_accounts WHERE user_handle = ?').get(handle).balance_micros,
+        startingBalance,
+    );
+    assert.equal(db.prepare('SELECT redeemed_by FROM credit_codes WHERE id = ?').get(cardId).redeemed_by, null);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM point_ledger WHERE reference_id = ?').get(cardId).count, 0);
+});
+
+test('admin credit code creation clamps the count and rejects non-positive amounts', async (t) => {
+    const db = getCommunityDb();
+    const label = 'boundary-credit-codes';
+    t.after(() => db.prepare('DELETE FROM credit_codes WHERE label = ?').run(label));
+
+    // count 上限 100：请求 1000 张只会发出 100 张，防止一次性刷爆数据库。
+    const clamped = await invokeRoute(createCreditCodes, { amount: 5, count: 1000, label });
+    assert.equal(clamped.status, 201);
+    assert.equal(clamped.body.cards.length, 100);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM credit_codes WHERE label = ?').get(label).count, 100);
+    assert.ok(clamped.body.cards.every(card => /^POINTS(-[0-9A-F]{4}){3}$/.test(card.code)));
+
+    const rejected = await invokeRoute(createCreditCodes, { amount: 0, count: 1, label });
+    assert.equal(rejected.status, 400);
+    assert.match(String(rejected.body.error), /大于 0/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM credit_codes WHERE label = ?').get(label).count, 100);
+});
+
+test('story routes neutralize path traversal ids without touching files outside the stories directory', async (t) => {
+    const storiesDirectory = path.join(userRoot, 'aibar', 'stories');
+    const settingsBefore = fs.readFileSync(settingsPath, 'utf8');
+
+    // stories/../../settings.json 恰好指向账号根目录的 settings.json，是最现实的越界目标。
+    const read = await invokeRoute(getStory, { id: '../../settings' });
+    assert.equal(read.status, 404);
+    assert.ok(!String(read.body).includes('simple_ui_mods'), 'must not return the settings file content');
+    assert.ok(!String(read.body).includes(testRoot), 'must not leak absolute paths');
+
+    const removed = await invokeRoute(deleteStory, { id: '../../settings' });
+    assert.equal(removed.status, 404);
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), settingsBefore, 'settings.json must survive the delete attempt');
+
+    const saved = await invokeRoute(saveStory, {
+        story: { id: '../../escaped-story', title: 'Traversal Story', characterAvatar },
+    });
+    assert.equal(saved.status, 200);
+    const savedPath = path.resolve(storiesDirectory, `${saved.body.id}.json`);
+    t.after(() => fs.rmSync(savedPath, { force: true }));
+    assert.ok(savedPath.startsWith(`${storiesDirectory}${path.sep}`), 'the sanitized id must stay inside the stories directory');
+    assert.equal(fs.existsSync(savedPath), true);
+    assert.equal(fs.existsSync(path.join(userRoot, 'escaped-story.json')), false);
+    assert.equal(fs.existsSync(path.join(testRoot, 'escaped-story.json')), false);
+});
+
+test('image file routes reject traversal file names without serving or deleting outside files', async () => {
+    const outside = await invokeRoute(getImageFile, {}, undefined, { params: { fileName: '../../settings.json' } });
+    assert.equal(outside.status, 404);
+    assert.equal(outside.body, null, 'no file path may reach sendFile');
+
+    // '..' 会被 sanitize 成空串并触发显式拒绝。
+    const invalid = await suppressExpectedErrors(() => invokeRoute(getImageFile, {}, undefined, { params: { fileName: '..' } }));
+    assert.ok([400, 404].includes(invalid.status), String(invalid.status));
+    assert.ok(!String(invalid.body).includes(testRoot), 'must not leak absolute paths');
+
+    // 删除走 index.json 的 id 查找，越界 id 根本找不到条目。
+    const removed = await invokeRoute(deleteImage, { id: '../../settings' });
+    assert.equal(removed.status, 404);
+    assert.equal(fs.existsSync(settingsPath), true);
+});
+
+test('community publication rejects traversal private source file names', async () => {
+    const attempts = [
+        { sourceType: 'character', sourceId: `../characters/${characterAvatar}`, title: 'Traversal Character Publish' },
+        { sourceType: 'story', sourceId: '../../settings', title: 'Traversal Story Publish' },
+    ];
+    for (const attempt of attempts) {
+        const result = await suppressExpectedErrors(() => invokeRoute(publishWork, attempt));
+        // assertPrivateFile 要求 sanitize 后的文件名与原名一致，任何路径片段都会被拒绝。
+        assert.equal(result.status, 400, attempt.sourceType);
+        assert.ok(!String(result.body.error).includes(testRoot), attempt.sourceType);
+        assert.equal(
+            getCommunityDb().prepare('SELECT COUNT(*) AS count FROM works WHERE title = ?').get(attempt.title).count,
+            0,
+            attempt.sourceType,
+        );
+    }
+});
+
+test('community version assets refuse paths escaping the community root', async (t) => {
+    const db = getCommunityDb();
+    const workId = 'traversal-asset-work';
+    const versionId = 'traversal-asset-version';
+    const absoluteVersionId = 'traversal-asset-version-absolute';
+    const now = new Date().toISOString();
+    // 直接在数据库里伪造越界 asset_path，验证 resolveCommunityAsset 是数据被污染后的最后一道防线。
+    // '../user/settings.json' 相对社区根目录（DATA_ROOT/_aibar）解析后正好落在真实存在的账号 settings.json 上。
+    db.prepare(`
+        INSERT INTO works (
+            id, type, author_handle, author_name, title, summary,
+            latest_version_id, status, published_at, updated_at
+        ) VALUES (?, 'character', 'admin', 'Admin', 'Traversal Asset Work', '', ?, 'published', ?, ?)
+    `).run(workId, versionId, now, now);
+    const insertVersion = db.prepare(`
+        INSERT INTO work_versions (id, work_id, version_number, title, payload_json, asset_path, cover_path, created_at)
+        VALUES (?, ?, ?, 'Traversal Asset Work', '{}', ?, ?, ?)
+    `);
+    insertVersion.run(versionId, workId, 1, path.join('..', 'user', 'settings.json'), path.join('..', 'user', 'settings.json'), now);
+    insertVersion.run(absoluteVersionId, workId, 2, settingsPath, settingsPath, now);
+    t.after(() => db.prepare('DELETE FROM works WHERE id = ?').run(workId));
+
+    for (const id of [versionId, absoluteVersionId]) {
+        const result = await suppressExpectedErrors(() => invokeRoute(getWorkVersion, {}, undefined, {
+            params: { versionId: id, kind: 'asset' },
+        }));
+        assert.equal(result.status, 404, id);
+        assert.equal(result.body, null, 'sendFile must never receive the escaped path');
+    }
+});
+
+test('the model list advertises supportedSources consistent with the shared source validator', async () => {
+    const result = await invokeRoute(listModels, {});
+    assert.equal(result.status, 200);
+    const sources = result.body.supportedSources;
+    assert.ok(Array.isArray(sources) && sources.length > 0, 'supportedSources must be a non-empty array');
+    assert.ok(sources.includes('ai21'));
+    // 清单与 isSupportedSharedModelSource 必须同源，防止前端下拉与后端校验漂移。
+    for (const source of sources) {
+        assert.equal(isSupportedSharedModelSource(source), true, source);
+    }
+    assert.equal(new Set(sources).size, sources.length, 'supportedSources must not contain duplicates');
+    for (const blocked of ['azure_openai', 'vertexai', 'workers_ai', 'unknown-provider']) {
+        assert.equal(sources.includes(blocked), false, blocked);
+    }
+});
+
+test('validateDiscordAttachmentUrl accepts only canonical Discord CDN attachment URLs', () => {
+    const valid = validateDiscordAttachmentUrl('https://cdn.discordapp.com/attachments/12345678901234567/76543210987654321/card.png');
+    assert.equal(valid.hostname, 'cdn.discordapp.com');
+    assert.equal(
+        validateDiscordAttachmentUrl('https://media.discordapp.net/attachments/12345678901234567/76543210987654321/card.json').hostname,
+        'media.discordapp.net',
+    );
+
+    const rejected = [
+        // http 明文
+        'http://cdn.discordapp.com/attachments/12345678901234567/76543210987654321/card.png',
+        // 显式端口
+        'https://cdn.discordapp.com:8443/attachments/12345678901234567/76543210987654321/card.png',
+        // 带用户名密码（SSRF 混淆常用手法）
+        'https://user:secret@cdn.discordapp.com/attachments/12345678901234567/76543210987654321/card.png',
+        // 非白名单主机
+        'https://cdn.evil.example/attachments/12345678901234567/76543210987654321/card.png',
+        // 路径前缀不匹配
+        'https://cdn.discordapp.com/files/12345678901234567/76543210987654321/card.png',
+        // 不支持的扩展名
+        'https://cdn.discordapp.com/attachments/12345678901234567/76543210987654321/card.exe',
+        // '..' 会被 URL 规范化掉，规范化后的路径同样不匹配附件模式
+        'https://cdn.discordapp.com/attachments/../76543210987654321/card.png',
+    ];
+    for (const url of rejected) {
+        assert.throws(
+            () => validateDiscordAttachmentUrl(url),
+            error => error.status === 400 && /Only supported Discord CDN attachments/.test(error.message),
+            url,
+        );
+    }
+    assert.throws(
+        () => validateDiscordAttachmentUrl('not-a-url'),
+        error => error.status === 400 && /Invalid Discord attachment URL/.test(error.message),
+    );
+});
+
+const settingsRouteProfile = { handle: 'settings-route-user', name: 'Settings Route User', admin: false };
+
+test('AIBAR settings get returns the aibar section for every settings.json shape', async (t) => {
+    // 用独立的账号根目录，避免污染其他测试共享的 settings.json 夹具。
+    const root = path.join(testRoot, 'settings-get-root');
+    fs.mkdirSync(root, { recursive: true });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const userDirectories = { ...directories, root };
+    const filePath = path.join(root, 'settings.json');
+
+    const missing = await invokeRoute(getAibarSettings, {}, settingsRouteProfile, { userDirectories });
+    assert.equal(missing.status, 200);
+    assert.deepEqual(missing.body, { settings: {} }, 'a missing settings.json must read as empty');
+
+    fs.writeFileSync(filePath, JSON.stringify({ foo: 1 }), 'utf8');
+    assert.deepEqual(
+        (await invokeRoute(getAibarSettings, {}, settingsRouteProfile, { userDirectories })).body,
+        { settings: {} },
+        'settings.json without an aibar key must read as empty',
+    );
+
+    fs.writeFileSync(filePath, JSON.stringify({ foo: 1, aibar: [1, 2] }), 'utf8');
+    assert.deepEqual(
+        (await invokeRoute(getAibarSettings, {}, settingsRouteProfile, { userDirectories })).body,
+        { settings: {} },
+        'a non-object aibar key must read as empty',
+    );
+
+    fs.writeFileSync(filePath, JSON.stringify({ foo: 1, aibar: { theme: 'dark' } }), 'utf8');
+    assert.deepEqual(
+        (await invokeRoute(getAibarSettings, {}, settingsRouteProfile, { userDirectories })).body,
+        { settings: { theme: 'dark' } },
+    );
+});
+
+test('AIBAR settings save shallow-merges the aibar key and leaves other top-level keys alone', async (t) => {
+    const root = path.join(testRoot, 'settings-save-root');
+    fs.mkdirSync(root, { recursive: true });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const userDirectories = { ...directories, root };
+    const filePath = path.join(root, 'settings.json');
+    fs.writeFileSync(filePath, JSON.stringify({ foo: 1, aibar: { keep: 'x', old: 1 } }), 'utf8');
+
+    // triggerAutoSave 的 throttle 定时器由 --test-force-exit 兜底，不会拖住测试进程。
+    const saved = await invokeRoute(saveAibarSettings, { old: 2, added: true }, settingsRouteProfile, { userDirectories });
+    assert.equal(saved.status, 200);
+    // 返回值必须就是合并后的 aibar 对象。
+    assert.deepEqual(saved.body, { settings: { keep: 'x', old: 2, added: true } });
+    const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    assert.equal(onDisk.foo, 1, 'foreign top-level keys must survive the merge');
+    assert.deepEqual(onDisk.aibar, { keep: 'x', old: 2, added: true });
+
+    for (const body of [[1, 2], 'not-an-object', null]) {
+        const invalid = await invokeRoute(saveAibarSettings, body, settingsRouteProfile, { userDirectories });
+        assert.equal(invalid.status, 400, JSON.stringify(body));
+    }
+    assert.deepEqual(
+        JSON.parse(fs.readFileSync(filePath, 'utf8')),
+        { foo: 1, aibar: { keep: 'x', old: 2, added: true } },
+        'invalid bodies must not modify the file',
+    );
+});
+
+test('a fresh community database lands on user_version 3 and replays from 0 without data loss', () => {
+    const databasePath = path.join(testRoot, 'user-version-cursor.sqlite');
+    let db = createCommunityDatabase(databasePath);
+    try {
+        assert.equal(Number(db.pragma('user_version', { simple: true })), 3);
+        db.prepare(`
+            INSERT INTO invites (id, code_hash, label, created_by, max_uses, created_at)
+            VALUES ('cursor-invite', 'cursor-hash', '', 'admin', 10, ?)
+        `).run(new Date().toISOString());
+        db.prepare(`
+            INSERT INTO registration_requests (
+                id, handle, name, password_hash, password_salt, invite_id, created_at
+            ) VALUES ('cursor-registration', 'cursor-registration', 'Cursor', 'hash', 'salt', 'cursor-invite', ?)
+        `).run(new Date().toISOString());
+        db.prepare(`
+            INSERT INTO works (
+                id, type, author_handle, author_name, title, summary,
+                latest_version_id, status, published_at, updated_at
+            ) VALUES ('cursor-work', 'mod', 'admin', 'Admin', 'Cursor Work', '', NULL, 'published', ?, ?)
+        `).run(new Date().toISOString(), new Date().toISOString());
+        // 把游标拨回 0，模拟 user_version 机制引入之前的存量库。
+        db.pragma('user_version = 0');
+    } finally {
+        db.close();
+    }
+
+    db = createCommunityDatabase(databasePath);
+    try {
+        // 迁移重放必须幂等：游标回到 3，数据一行不丢、状态不变。
+        assert.equal(Number(db.pragma('user_version', { simple: true })), 3);
+        assert.equal(
+            db.prepare('SELECT status FROM registration_requests WHERE id = ?').get('cursor-registration').status,
+            'pending',
+        );
+        assert.equal(db.prepare('SELECT title FROM works WHERE id = ?').get('cursor-work').title, 'Cursor Work');
+        assert.equal(
+            db.prepare('SELECT COUNT(*) AS count FROM registration_requests WHERE handle = ?').get('cursor-registration').count,
+            1,
+        );
+    } finally {
+        db.close();
+    }
 });

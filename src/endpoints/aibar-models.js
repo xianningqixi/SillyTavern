@@ -4,7 +4,7 @@ import express from 'express';
 import storage from 'node-persist';
 
 import { CHAT_COMPLETION_SOURCES } from '../constants.js';
-import { publicError } from '../aibar-errors.js';
+import { publicError, publicErrorStatus } from '../aibar-errors.js';
 import { createUserRateLimiter } from '../aibar-rate-limit.js';
 import { getCommunityDb, hashInviteCode } from '../aibar-community-db.js';
 import { KEY_PREFIX, getUserDirectories, requireAdminMiddleware, toKey } from '../users.js';
@@ -22,30 +22,6 @@ const GENERATE_MAX_CONCURRENCY = 3;
 const activeReservationIds = new Set();
 /** @type {Map<string, number>} 每个用户当前进行中的共享生成请求数 */
 const activeGenerationCounts = new Map();
-const supportedSources = new Set([
-    CHAT_COMPLETION_SOURCES.OPENAI,
-    CHAT_COMPLETION_SOURCES.CLAUDE,
-    CHAT_COMPLETION_SOURCES.OPENROUTER,
-    CHAT_COMPLETION_SOURCES.AI21,
-    CHAT_COMPLETION_SOURCES.MAKERSUITE,
-    CHAT_COMPLETION_SOURCES.MISTRALAI,
-    CHAT_COMPLETION_SOURCES.CUSTOM,
-    CHAT_COMPLETION_SOURCES.COHERE,
-    CHAT_COMPLETION_SOURCES.PERPLEXITY,
-    CHAT_COMPLETION_SOURCES.GROQ,
-    CHAT_COMPLETION_SOURCES.CHUTES,
-    CHAT_COMPLETION_SOURCES.ELECTRONHUB,
-    CHAT_COMPLETION_SOURCES.NANOGPT,
-    CHAT_COMPLETION_SOURCES.DEEPSEEK,
-    CHAT_COMPLETION_SOURCES.AIMLAPI,
-    CHAT_COMPLETION_SOURCES.XAI,
-    CHAT_COMPLETION_SOURCES.POLLINATIONS,
-    CHAT_COMPLETION_SOURCES.MOONSHOT,
-    CHAT_COMPLETION_SOURCES.FIREWORKS,
-    CHAT_COMPLETION_SOURCES.ZAI,
-    CHAT_COMPLETION_SOURCES.SILICONFLOW,
-    CHAT_COMPLETION_SOURCES.MINIMAX,
-]);
 const sourceSecretKeys = {
     [CHAT_COMPLETION_SOURCES.OPENAI]: SECRET_KEYS.OPENAI,
     [CHAT_COMPLETION_SOURCES.CLAUDE]: SECRET_KEYS.CLAUDE,
@@ -70,6 +46,8 @@ const sourceSecretKeys = {
     [CHAT_COMPLETION_SOURCES.SILICONFLOW]: SECRET_KEYS.SILICONFLOW,
     [CHAT_COMPLETION_SOURCES.MINIMAX]: SECRET_KEYS.MINIMAX,
 };
+// 共享模型允许的渠道以 sourceSecretKeys 为唯一事实来源，避免两份清单漂移。
+const supportedSources = new Set(Object.keys(sourceSecretKeys));
 
 export function isSupportedSharedModelSource(source) {
     return supportedSources.has(source);
@@ -544,6 +522,8 @@ router.post('/models/list', async (request, response) => {
                 includePrivate: isAdmin && row.owner_handle === handle,
                 includeAdminState: isAdmin,
             })),
+            // 前端渠道下拉与校验以该清单为准，静态清单仅作加载前兜底。
+            supportedSources: [...supportedSources],
         });
     } catch (error) {
         console.error('AIBAR model list failed:', error);
@@ -631,7 +611,7 @@ router.post('/admin/models/save', requireAdminMiddleware, (request, response) =>
         }));
     } catch (error) {
         console.error('AIBAR model save failed:', error);
-        return response.status(400).json({ error: publicError(error, '模型保存失败') });
+        return response.status(publicErrorStatus(error)).json({ error: publicError(error, '模型保存失败') });
     }
 });
 
@@ -643,7 +623,7 @@ router.post('/admin/models/delete', requireAdminMiddleware, (request, response) 
         return response.sendStatus(204);
     } catch (error) {
         console.error('AIBAR model delete failed:', error);
-        return response.status(400).json({ error: publicError(error, '模型删除失败') });
+        return response.status(publicErrorStatus(error)).json({ error: publicError(error, '模型删除失败') });
     }
 });
 
@@ -808,7 +788,7 @@ router.post('/points/redeem', redeemRateLimiter, (request, response) => {
         })();
         return response.json(accountView(redeemed));
     } catch (error) {
-        return response.status(400).json({ error: publicError(error, '兑换失败，请稍后再试') });
+        return response.status(publicErrorStatus(error)).json({ error: publicError(error, '兑换失败，请稍后再试') });
     }
 });
 
@@ -846,7 +826,7 @@ router.post('/admin/points/codes/create', requireAdminMiddleware, (request, resp
         return response.status(201).json({ cards });
     } catch (error) {
         console.error('AIBAR credit code creation failed:', error);
-        return response.status(400).json({ error: publicError(error, '额度卡创建失败') });
+        return response.status(publicErrorStatus(error)).json({ error: publicError(error, '额度卡创建失败') });
     }
 });
 
@@ -858,7 +838,7 @@ router.post('/admin/points/codes/toggle', requireAdminMiddleware, (request, resp
         if (!result.changes) return response.status(404).json({ error: '额度卡不存在或已兑换' });
         return response.sendStatus(204);
     } catch (error) {
-        return response.status(400).json({ error: publicError(error, '额度卡更新失败') });
+        return response.status(publicErrorStatus(error)).json({ error: publicError(error, '额度卡更新失败') });
     }
 });
 

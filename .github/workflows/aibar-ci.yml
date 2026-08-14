@@ -1,0 +1,40 @@
+name: AIBAR CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    name: AIBAR Backend Tests & Lint
+    runs-on: ubuntu-latest
+    # Fork-only CI: never run on upstream or other forks
+    if: github.repository == 'xianningqixi/SillyTavern'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # .npmrc sets ignore-scripts=true, so native modules are not built by npm ci
+      - name: Rebuild better-sqlite3
+        run: npm rebuild better-sqlite3 --ignore-scripts=false
+
+      - name: Run AIBAR Backend Tests
+        run: npm run test:aibar
+
+      - name: Lint
+        run: npm run lint

@@ -33,7 +33,7 @@ const AUTOSAVE_FUNCTIONS = new Map();
  * @param {string} handle User handle
  * @returns {void}
  */
-function triggerAutoSave(handle) {
+export function triggerAutoSave(handle) {
     if (!AUTOSAVE_FUNCTIONS.has(handle)) {
         const throttledAutoSave = _.throttle(() => backupUserSettings(handle, true), AUTOSAVE_INTERVAL);
         AUTOSAVE_FUNCTIONS.set(handle, throttledAutoSave);

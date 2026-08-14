@@ -17,6 +17,7 @@ public/instruct/
 public/context/
 public/scripts/extensions/third-party/
 public/stats.json
+public/aibar/
 /uploads/
 *.jsonl
 /config.conf

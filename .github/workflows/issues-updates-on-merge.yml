@@ -15,7 +15,7 @@ jobs:
   update-linked-issues:
     name: 🔗 Mark Linked Issues Done on Push
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && github.repository == 'SillyTavern/SillyTavern'
 
     steps:
       - name: Mint App Token

@@ -15,7 +15,7 @@ jobs:
   check-merge-conflicts:
     name: ⚔️ Check Merge Conflicts
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && github.repository == 'SillyTavern/SillyTavern'
 
     steps:
       - name: Mint App Token

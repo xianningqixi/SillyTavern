@@ -282,6 +282,10 @@ function migrateWorksTypeConstraint(db) {
             FROM works;
             DROP TABLE works;
             ALTER TABLE works_migration RENAME TO works;
+            -- DROP TABLE 连带删掉了 works 的索引，迁移自己负责重建。
+            CREATE INDEX IF NOT EXISTS idx_works_latest ON works(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_works_author ON works(author_handle, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_works_type ON works(type);
             COMMIT;
         `);
     } catch (error) {
@@ -401,6 +405,29 @@ function clearReviewedRegistrationCredentials(db) {
     `).run();
 }
 
+/**
+ * 有序迁移列表，游标记录在 PRAGMA user_version 里。
+ *
+ * 历史包袱：user_version 机制引入之前的库停留在 0，但四个存量迁移全部幂等
+ * （字符串嗅探/IF NOT EXISTS/无条件 UPDATE），所以旧库首次升级会安全地重放
+ * 一遍，然后写入版本号；之后每次启动只比较一个整数，不再全量扫描。
+ * 新增迁移时在列表末尾追加严格递增的 version，不要修改已发布的条目。
+ */
+const MIGRATIONS = [
+    { version: 1, run: migrateWorksTypeConstraint },
+    { version: 2, run: migrateRegistrationInviteConstraint },
+    { version: 3, run: migrateRegistrationHandleConstraint },
+];
+
+function runMigrations(db) {
+    const current = Number(db.pragma('user_version', { simple: true })) || 0;
+    for (const migration of MIGRATIONS) {
+        if (migration.version <= current) continue;
+        migration.run(db);
+        db.pragma(`user_version = ${migration.version}`);
+    }
+}
+
 export function getCommunityRoot() {
     const dataRoot = globalThis.DATA_ROOT || path.resolve(process.cwd(), 'data');
     const root = path.resolve(dataRoot, '_aibar');
@@ -415,12 +442,10 @@ export function createCommunityDatabase(filePath) {
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
     db.exec(schema);
-    migrateWorksTypeConstraint(db);
-    migrateRegistrationInviteConstraint(db);
-    migrateRegistrationHandleConstraint(db);
+    runMigrations(db);
+    // 凭据清除是安全兜底而非一次性迁移：即使未来某条审核路径忘记清空
+    // 密码哈希，下次启动也会补救，所以每次都跑（小表全扫，代价可忽略）。
     clearReviewedRegistrationCredentials(db);
-    // Recreate indexes that belonged to the rebuilt works table.
-    db.exec(schema);
     return db;
 }
 
@@ -430,6 +455,28 @@ export function getCommunityDb() {
     }
     return communityDb;
 }
+
+/**
+ * 进程退出前把 WAL 合并回主库并关闭连接。没有 checkpoint 的话 WAL 会无限增长，
+ * 且"只拷 .sqlite 文件"的临时备份会丢掉 WAL 里未合并的数据。
+ * server-main 的优雅退出最终调用 process.exit()，'exit' 事件里允许同步收尾。
+ */
+export function closeCommunityDb() {
+    if (!communityDb) return;
+    try {
+        // 测试等场景可能已经手动 close 过单例，跳过即可。
+        if (communityDb.open) {
+            communityDb.pragma('wal_checkpoint(TRUNCATE)');
+            communityDb.close();
+        }
+    } catch (error) {
+        console.error('AIBAR community database close failed:', error);
+    } finally {
+        communityDb = undefined;
+    }
+}
+
+process.once('exit', closeCommunityDb);
 
 export function hashInviteCode(code) {
     return crypto.createHash('sha256').update(String(code || '').trim().toUpperCase()).digest('hex');
