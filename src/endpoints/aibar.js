@@ -286,23 +286,23 @@ function writeImageIndex(request, images) {
     writeFileSyncAtomic(filePath, JSON.stringify(images, null, 4), 'utf8');
 }
 
-function normalizeImageFormat(value, mimeType = '') {
-    const raw = String(value || '').toLowerCase().replace(/^\./, '');
-    if (['png', 'jpg', 'jpeg', 'webp'].includes(raw)) {
-        return raw === 'jpeg' ? 'jpg' : raw;
-    }
-    if (mimeType.includes('png')) return 'png';
-    if (mimeType.includes('webp')) return 'webp';
-    if (mimeType.includes('jpeg') || mimeType.includes('jpg')) return 'jpg';
-    return 'png';
+// 魔数嗅探：不信任声明格式，落盘扩展名以实际内容为准，也挡掉伪装成图片的任意字节
+function sniffImageFormat(buffer) {
+    if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'png';
+    if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpg';
+    if (
+        buffer.length >= 12
+        && buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46
+        && buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50
+    ) return 'webp';
+    return '';
 }
 
-function parseImageData(input, format) {
+function parseImageData(input) {
     const raw = String(input || '');
     const match = raw.match(/^data:([^;]+);base64,(.+)$/);
     const mimeType = match?.[1] || '';
     const base64 = (match?.[2] || raw).replace(/\s+/g, '');
-    const safeFormat = normalizeImageFormat(format, mimeType);
     const maximumEncodedLength = Math.ceil(SAVED_IMAGE_MAX_BYTES / 3) * 4 + 4;
     if (base64.length > maximumEncodedLength) {
         throw new AibarImageError('Image exceeds the 20 MB limit', 413);
@@ -317,7 +317,11 @@ function parseImageData(input, format) {
     if (buffer.length > SAVED_IMAGE_MAX_BYTES) {
         throw new AibarImageError('Image exceeds the 20 MB limit', 413);
     }
-    return { buffer, format: safeFormat, mimeType };
+    const sniffed = sniffImageFormat(buffer);
+    if (!sniffed) {
+        throw new AibarImageError('仅支持 PNG、JPG、WebP 图片');
+    }
+    return { buffer, format: sniffed, mimeType };
 }
 
 function getImageFilePath(request, fileName) {
@@ -447,7 +451,7 @@ router.post('/images/list', (request, response) => {
 
 router.post('/images/save', imageSaveLimiter, (request, response) => {
     try {
-        const { buffer, format } = parseImageData(request.body.image, request.body.format);
+        const { buffer, format } = parseImageData(request.body.image);
         const id = normalizeImageId(request.body.id);
         // 新图片受每用户数量上限约束；覆盖已有编号的图片始终允许。
         const existingImages = readImageIndex(request);

@@ -71,6 +71,7 @@ assert.equal(getCommunityRoot(), path.join(testRoot, '_aibar'));
 globalThis.DATA_ROOT = testRoot;
 
 const {
+    determineReservationMicros,
     determineSettlementCharge,
     estimateInputTokens,
     estimateSettlementInputTokens,
@@ -619,6 +620,30 @@ test('saved images reject invalid data and payloads above 20 MB', async () => {
     assert.equal(fs.existsSync(path.join(userRoot, 'aibar', 'images', 'oversized-image.png')), false);
 });
 
+test('saved images reject non-image bytes regardless of the declared format', async () => {
+    // 合法 base64 但不是 PNG/JPG/WebP 魔数开头
+    const notAnImage = Buffer.from('<script>alert(1)</script>' + 'x'.repeat(64)).toString('base64');
+    const rejected = await suppressExpectedErrors(() => invokeRoute(saveImage, {
+        id: 'not-an-image',
+        image: notAnImage,
+        format: 'png',
+    }));
+    assert.equal(rejected.status, 400);
+    assert.match(String(rejected.body), /PNG/);
+    assert.equal(fs.existsSync(path.join(userRoot, 'aibar', 'images', 'not-an-image.png')), false);
+
+    // 真实 PNG：落盘扩展名按魔数取 png，与声明格式一致
+    const realPng = fs.readFileSync(path.resolve('default/content/default_Seraphina.png'));
+    const accepted = await invokeRoute(saveImage, {
+        id: 'real-png',
+        image: realPng.toString('base64'),
+        format: 'jpg',
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.format, 'png');
+    assert.equal(accepted.body.fileName, 'real-png.png');
+});
+
 test('message estimation includes fields outside message.content', () => {
     assert.equal(typeof estimateInputTokens, 'function', 'aibar-models.js must export estimateInputTokens');
     assert.equal(typeof estimateSettlementInputTokens, 'function', 'aibar-models.js must export estimateSettlementInputTokens');
@@ -660,6 +685,22 @@ test('settlement can charge beyond an underestimated reservation without consumi
     assert.equal(determineSettlementCharge(1_200, 1_000, 200, reservedMicros), 900);
 });
 
+test('reservation holds the byte upper bound when affordable and falls back to the realistic estimate', () => {
+    assert.equal(typeof determineReservationMicros, 'function', 'aibar-models.js must export determineReservationMicros');
+
+    // 余额充足：按保守上限冻结，覆盖高熵内容
+    assert.equal(determineReservationMicros(1_000, 300, 5_000), 1_000);
+    // 上限冻不住但现实成本付得起：放行并冻结全部可用余额，而不是拒绝
+    assert.equal(determineReservationMicros(1_000, 300, 400), 400);
+    assert.equal(determineReservationMicros(1_000, 300, 300), 300);
+    // 连现实成本都不够：拒绝
+    assert.equal(determineReservationMicros(1_000, 300, 299), null);
+    assert.equal(determineReservationMicros(1_000, 300, 0), null);
+    // 边界：非法输入按 0 处理，现实成本与可用余额同为 0 时放行 0 冻结
+    assert.equal(determineReservationMicros(NaN, NaN, NaN), 0);
+    assert.equal(determineReservationMicros(0, 0, 0), 0);
+});
+
 test('settlement prefers provider usage and does not count wrapped Claude content twice', () => {
     const claude = summarizeCapture({
         body: {
@@ -668,11 +709,13 @@ test('settlement prefers provider usage and does not count wrapped Claude conten
             usage: { input_tokens: 123, output_tokens: 7 },
         },
         chunks: [],
+        capturedBytes: 10,
         statusCode: 200,
     }, 999);
     assert.deepEqual(claude, {
         inputTokens: 123,
         outputTokens: 7,
+        truncated: false,
         hasError: false,
         hasContent: true,
         usageReported: true,
@@ -699,6 +742,31 @@ test('settlement prefers provider usage and does not count wrapped Claude conten
     }, 99);
     assert.equal(gemini.inputTokens, 9);
     assert.equal(gemini.outputTokens, 4);
+});
+
+test('summarizeCapture flags truncated captures so settlement can fall back to the requested cap', () => {
+    const truncated = summarizeCapture({
+        body: { choices: [{ message: { content: 'partial' } }] },
+        chunks: [],
+        capturedBytes: 8 * 1024 * 1024,
+        statusCode: 200,
+    }, 10);
+    assert.equal(truncated.truncated, true);
+    assert.equal(truncated.usageReported, false);
+
+    // 提供商上报了用量时截断标记仍在，但结算端会优先采用上报值
+    const truncatedWithUsage = summarizeCapture({
+        body: {
+            choices: [{ message: { content: 'partial' } }],
+            usage: { prompt_tokens: 5, completion_tokens: 2 },
+        },
+        chunks: [],
+        capturedBytes: 8 * 1024 * 1024,
+        statusCode: 200,
+    }, 10);
+    assert.equal(truncatedWithUsage.truncated, true);
+    assert.equal(truncatedWithUsage.usageReported, true);
+    assert.equal(truncatedWithUsage.outputTokens, 2);
 });
 
 test('stale cleanup preserves active reservations until the request completes', () => {
@@ -1361,6 +1429,12 @@ test('manual Discord publication creates one public work and deduplicates by ser
     assert.equal(firstSnapshot.externalSource.provider, 'discord');
     assert.equal(firstSnapshot.externalSource.fileSha256, trustedHash);
     assert.equal(firstSnapshot.externalSource.channelId, firstSource.channelId);
+    // 查重走索引列而不是 json_extract 全表扫描：发布后两列都必须落库
+    const indexed = getCommunityDb().prepare(`
+        SELECT external_sha256, external_thread_key FROM work_versions WHERE id = ?
+    `).get(firstPublish.body.versionId);
+    assert.equal(indexed.external_sha256, trustedHash);
+    assert.equal(indexed.external_thread_key, `${firstSource.guildId}:${firstSource.channelId}:${firstSource.threadId}@admin`);
 
     const duplicatePublish = await invokeRoute(publishDiscordWork, {
         sourceId: characterAvatar,
@@ -2254,11 +2328,11 @@ test('AIBAR settings save shallow-merges the aibar key and leaves other top-leve
     );
 });
 
-test('a fresh community database lands on user_version 3 and replays from 0 without data loss', () => {
+test('a fresh community database lands on user_version 4 and replays from 0 without data loss', () => {
     const databasePath = path.join(testRoot, 'user-version-cursor.sqlite');
     let db = createCommunityDatabase(databasePath);
     try {
-        assert.equal(Number(db.pragma('user_version', { simple: true })), 3);
+        assert.equal(Number(db.pragma('user_version', { simple: true })), 4);
         db.prepare(`
             INSERT INTO invites (id, code_hash, label, created_by, max_uses, created_at)
             VALUES ('cursor-invite', 'cursor-hash', '', 'admin', 10, ?)
@@ -2282,8 +2356,8 @@ test('a fresh community database lands on user_version 3 and replays from 0 with
 
     db = createCommunityDatabase(databasePath);
     try {
-        // 迁移重放必须幂等：游标回到 3，数据一行不丢、状态不变。
-        assert.equal(Number(db.pragma('user_version', { simple: true })), 3);
+        // 迁移重放必须幂等：游标回到 4，数据一行不丢、状态不变。
+        assert.equal(Number(db.pragma('user_version', { simple: true })), 4);
         assert.equal(
             db.prepare('SELECT status FROM registration_requests WHERE id = ?').get('cursor-registration').status,
             'pending',

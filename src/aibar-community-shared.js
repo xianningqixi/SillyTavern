@@ -302,6 +302,29 @@ export class CommunityPublishError extends Error {
     }
 }
 
+/**
+ * Discord 发布查重的索引列取值。thread key 把作者拼进键里，使"同一作者同一
+ * thread 找旧版本"的查询单列索引即可命中。拼法与数据库迁移回填保持一致
+ * （aibar-community-db.js migrateWorkVersionExternalKeys）。
+ */
+export function externalVersionKeys(authorHandle, externalSource) {
+    if (!externalSource) return { externalSha256: null, externalThreadKey: null };
+    // 写入端传完整 externalSource（带 provider）；查重端传 normalizeDiscordPublicSource
+    // 的产物（只有三个 id），无 provider 字段时按 discord 键处理。
+    if (externalSource.provider !== undefined && externalSource.provider !== 'discord') {
+        return { externalSha256: null, externalThreadKey: null };
+    }
+    const sha256 = String(externalSource.fileSha256 || '').trim();
+    return {
+        externalSha256: sha256 || null,
+        externalThreadKey: [
+            externalSource.guildId,
+            externalSource.channelId,
+            externalSource.threadId,
+        ].join(':') + `@${authorHandle}`,
+    };
+}
+
 export async function publishCommunitySource(request, input, options = {}) {
     let versionDirectory = '';
     let published = false;
@@ -361,6 +384,7 @@ export async function publishCommunitySource(request, input, options = {}) {
         const createdAt = nowIso();
         const relativeAsset = path.relative(root, assetPath);
         const relativeCover = path.relative(root, coverPath);
+        const externalKeys = externalVersionKeys(request.user.profile.handle, options.externalSource);
         db.transaction(() => {
             if (existing) {
                 db.prepare(`
@@ -387,8 +411,8 @@ export async function publishCommunitySource(request, input, options = {}) {
             db.prepare(`
                 INSERT INTO work_versions (
                     id, work_id, version_number, version_note, title, summary,
-                    payload_json, asset_path, cover_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload_json, asset_path, cover_path, external_sha256, external_thread_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 versionId,
                 workId,
@@ -399,6 +423,8 @@ export async function publishCommunitySource(request, input, options = {}) {
                 JSON.stringify(snapshot),
                 relativeAsset,
                 relativeCover,
+                externalKeys.externalSha256,
+                externalKeys.externalThreadKey,
                 createdAt,
             );
             const insertTag = db.prepare('INSERT INTO work_tags (version_id, tag) VALUES (?, ?)');

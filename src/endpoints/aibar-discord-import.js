@@ -12,6 +12,7 @@ import { getCommunityDb, getCommunityRoot } from '../aibar-community-db.js';
 import {
     CommunityPublishError,
     capturePrivateSource,
+    externalVersionKeys,
     getManagedWorkRow,
     getWorkRow,
     nowIso,
@@ -583,8 +584,7 @@ async function publishDiscordCharacter(request, sourceId, discordSource) {
         FROM work_versions v
         JOIN works w ON w.id = v.work_id
         WHERE w.type = 'character' AND w.status = 'published'
-          AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
-          AND json_extract(v.payload_json, '$.externalSource.fileSha256') = ?
+          AND v.external_sha256 = ?
         ORDER BY v.created_at DESC
         LIMIT 1
     `).get(fileSha256);
@@ -602,19 +602,11 @@ async function publishDiscordCharacter(request, sourceId, discordSource) {
         SELECT w.id AS work_id
         FROM work_versions v
         JOIN works w ON w.id = v.work_id
-        WHERE w.type = 'character' AND w.author_handle = ?
-          AND json_extract(v.payload_json, '$.externalSource.provider') = 'discord'
-          AND json_extract(v.payload_json, '$.externalSource.guildId') = ?
-          AND json_extract(v.payload_json, '$.externalSource.channelId') = ?
-          AND json_extract(v.payload_json, '$.externalSource.threadId') = ?
+        WHERE w.type = 'character'
+          AND v.external_thread_key = ?
         ORDER BY v.created_at DESC
         LIMIT 1
-    `).get(
-        request.user.profile.handle,
-        discordSource.guildId,
-        discordSource.channelId,
-        discordSource.threadId,
-    );
+    `).get(externalVersionKeys(request.user.profile.handle, discordSource).externalThreadKey);
     const externalSource = {
         provider: 'discord',
         guildId: discordSource.guildId,

@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS work_versions (
     payload_json TEXT NOT NULL,
     asset_path TEXT NOT NULL,
     cover_path TEXT NOT NULL,
+    external_sha256 TEXT,
+    external_thread_key TEXT,
     created_at TEXT NOT NULL,
     UNIQUE (work_id, version_number)
 );
@@ -406,6 +408,39 @@ function clearReviewedRegistrationCredentials(db) {
 }
 
 /**
+ * Discord 发布查重原先用 json_extract(payload_json) 全表扫描，作品量增长后
+ * 每次发布都是逐行 JSON 解析。这里把哈希与 thread 归属提升为普通列并建索引，
+ * 存量数据从 payload_json 回填一次。旧库补列、新库建表时已带列，均幂等。
+ * @param {import('better-sqlite3').Database} db Community database
+ */
+function migrateWorkVersionExternalKeys(db) {
+    const columns = new Set(db.prepare('PRAGMA table_info(work_versions)').all().map(column => column.name));
+    db.transaction(() => {
+        if (!columns.has('external_sha256')) {
+            db.exec('ALTER TABLE work_versions ADD COLUMN external_sha256 TEXT');
+        }
+        if (!columns.has('external_thread_key')) {
+            db.exec('ALTER TABLE work_versions ADD COLUMN external_thread_key TEXT');
+        }
+        // thread key 的写入端拼法必须与此处回填保持一致（见 aibar-community-shared.js externalVersionKeys）
+        db.exec(`
+            UPDATE work_versions SET
+                external_sha256 = json_extract(payload_json, '$.externalSource.fileSha256'),
+                external_thread_key = (
+                    SELECT json_extract(payload_json, '$.externalSource.guildId')
+                        || ':' || json_extract(payload_json, '$.externalSource.channelId')
+                        || ':' || json_extract(payload_json, '$.externalSource.threadId')
+                ) || '@' || (SELECT author_handle FROM works WHERE works.id = work_versions.work_id)
+            WHERE external_sha256 IS NULL
+                AND json_extract(payload_json, '$.externalSource.provider') = 'discord'
+                AND json_extract(payload_json, '$.externalSource.fileSha256') IS NOT NULL
+        `);
+        db.exec('CREATE INDEX IF NOT EXISTS idx_versions_external_sha ON work_versions(external_sha256)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_versions_external_thread ON work_versions(external_thread_key)');
+    })();
+}
+
+/**
  * 有序迁移列表，游标记录在 PRAGMA user_version 里。
  *
  * 历史包袱：user_version 机制引入之前的库停留在 0，但四个存量迁移全部幂等
@@ -417,6 +452,7 @@ const MIGRATIONS = [
     { version: 1, run: migrateWorksTypeConstraint },
     { version: 2, run: migrateRegistrationInviteConstraint },
     { version: 3, run: migrateRegistrationHandleConstraint },
+    { version: 4, run: migrateWorkVersionExternalKeys },
 ];
 
 function runMigrations(db) {

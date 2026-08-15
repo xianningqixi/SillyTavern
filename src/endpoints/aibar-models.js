@@ -197,7 +197,22 @@ export function determineSettlementCharge(calculatedMicros, balanceMicros, heldM
     return Math.min(Math.max(0, Number(calculatedMicros)), spendableMicros);
 }
 
-function reserveGeneration(userHandle, model, inputTokens, maxOutputTokens) {
+/**
+ * 预留冻结量：默认按字节数上限冻结（覆盖 base64 等高熵内容），但余额不足时用
+ * 现实估算二次判断——现实成本付得起就放行并冻结全部可用余额，而不是直接拒绝。
+ * 结算本就允许超过预留扣费（见 determineSettlementCharge），所以宁可少冻不可误拒。
+ * @returns {number|null} 应冻结的额度；null 表示余额连现实成本都不够，应拒绝
+ */
+export function determineReservationMicros(upperBoundMicros, realisticMicros, availableMicros) {
+    const upper = Math.max(0, Math.round(Number(upperBoundMicros) || 0));
+    const realistic = Math.max(0, Math.round(Number(realisticMicros) || 0));
+    const available = Math.max(0, Math.round(Number(availableMicros) || 0));
+    if (available >= upper) return upper;
+    if (realistic <= available) return available;
+    return null;
+}
+
+function reserveGeneration(userHandle, model, inputTokens, maxOutputTokens, realisticInputTokens) {
     const db = getCommunityDb();
     releaseStaleReservations(db);
     const reservedMicros = calculateCostMicros(
@@ -206,33 +221,41 @@ function reserveGeneration(userHandle, model, inputTokens, maxOutputTokens) {
         maxOutputTokens,
         model.output_price_micros,
     );
+    const realisticMicros = calculateCostMicros(
+        realisticInputTokens,
+        model.input_price_micros,
+        maxOutputTokens,
+        model.output_price_micros,
+    );
     const usageId = crypto.randomUUID();
     const createdAt = nowIso();
 
+    let holdMicros = 0;
     const account = db.transaction(() => {
         const current = ensurePointAccount(db, userHandle);
         const available = Number(current.balance_micros) - Number(current.held_micros);
-        if (available < reservedMicros) {
+        holdMicros = determineReservationMicros(reservedMicros, realisticMicros, available);
+        if (holdMicros === null) {
             const error = new Error('积分不足，请先兑换额度卡');
             error.code = 'INSUFFICIENT_POINTS';
             error.availableMicros = Math.max(0, available);
-            error.requiredMicros = reservedMicros;
+            error.requiredMicros = realisticMicros;
             throw error;
         }
         db.prepare(`
             UPDATE point_accounts SET held_micros = held_micros + ?, updated_at = ?
             WHERE user_handle = ?
-        `).run(reservedMicros, createdAt, userHandle);
+        `).run(holdMicros, createdAt, userHandle);
         db.prepare(`
             INSERT INTO model_usage (
                 id, user_handle, model_id, input_tokens, reserved_micros, status, created_at
             ) VALUES (?, ?, ?, ?, ?, 'reserved', ?)
-        `).run(usageId, userHandle, model.id, inputTokens, reservedMicros, createdAt);
+        `).run(usageId, userHandle, model.id, inputTokens, holdMicros, createdAt);
         return db.prepare('SELECT * FROM point_accounts WHERE user_handle = ?').get(userHandle);
     })();
 
     trackActiveReservation(usageId);
-    return { usageId, reservedMicros, maxOutputTokens, account };
+    return { usageId, reservedMicros: holdMicros, maxOutputTokens, account };
 }
 
 function extractContent(payload) {
@@ -311,9 +334,13 @@ export function summarizeCapture(capture, estimatedInputTokens) {
         }
         content += extractContent(payload);
     }
+    // 捕获达到上限时截断后的内容不再完整，按截断前内容估 token 会少计费；
+    // 返回 truncated 让结算端决定兜底（提供商用量不受影响）。
+    const truncated = capture.capturedBytes >= MAX_CAPTURE_BYTES;
     return {
         inputTokens: inputTokens || estimatedInputTokens,
         outputTokens: outputTokens || estimateTextTokens(content),
+        truncated,
         hasError,
         hasContent: content.trim().length > 0,
         usageReported: inputTokens > 0 || outputTokens > 0,
@@ -327,10 +354,14 @@ export function settleGeneration(reservation, model, capture, estimatedInputToke
         const failed = capture.statusCode >= 400 || summary.hasError;
         // 流式响应中途出错但已经产出内容时，仍按实际用量计费；完全没有内容才免单。
         const billable = capture.statusCode < 400 && (!summary.hasError || summary.hasContent);
+        // 截断且提供方未上报用量时，输出 token 只能按请求上限兜底，宁可多估不少估。
+        const outputTokensForBilling = summary.truncated && !summary.usageReported
+            ? Math.max(summary.outputTokens, reservation.maxOutputTokens)
+            : summary.outputTokens;
         const calculatedMicros = !billable ? 0 : calculateCostMicros(
             summary.inputTokens,
             model.input_price_micros,
-            summary.outputTokens,
+            outputTokensForBilling,
             model.output_price_micros,
         );
         const completedAt = nowIso();
@@ -358,12 +389,13 @@ export function settleGeneration(reservation, model, capture, estimatedInputToke
                 WHERE id = ?
             `).run(
                 summary.inputTokens,
-                summary.outputTokens,
+                outputTokensForBilling,
                 chargedMicros,
                 failed ? 'failed' : 'completed',
                 JSON.stringify({
                     statusCode: capture.statusCode,
                     usageReported: summary.usageReported,
+                    truncated: summary.truncated,
                     calculatedMicros,
                     unchargedMicros: Math.max(0, calculatedMicros - chargedMicros),
                 }),
@@ -382,7 +414,7 @@ export function settleGeneration(reservation, model, capture, estimatedInputToke
                     -chargedMicros,
                     balanceAfter,
                     usage.id,
-                    JSON.stringify({ modelId: model.id, inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }),
+                    JSON.stringify({ modelId: model.id, inputTokens: summary.inputTokens, outputTokens: outputTokensForBilling }),
                     completedAt,
                 );
             }
@@ -660,8 +692,20 @@ router.post('/models/generate', generateRateLimiter, async (request, response) =
         return response.status(429).json({ error: { message: '同时进行的生成请求过多，请等待现有回复完成' } });
     }
     activeGenerationCounts.set(userHandle, activeCount + 1);
+    let concurrencyReleased = false;
+    const releaseConcurrencySlot = () => {
+        if (concurrencyReleased) return;
+        concurrencyReleased = true;
+        const current = activeGenerationCounts.get(userHandle) || 1;
+        if (current <= 1) {
+            activeGenerationCounts.delete(userHandle);
+        } else {
+            activeGenerationCounts.set(userHandle, current - 1);
+        }
+    };
 
     let reservation;
+    let responseInstrumented = false;
     try {
         if (!request.body || typeof request.body !== 'object') {
             return response.status(400).json({ error: { message: '请求内容无效' } });
@@ -689,8 +733,19 @@ router.post('/models/generate', generateRateLimiter, async (request, response) =
             Number(model.max_tokens),
             Number(model.max_tokens),
         ));
-        reservation = reserveGeneration(request.user.profile.handle, model, reservationInputTokens, maxOutputTokens);
-        instrumentResponse(response, capture => settleGeneration(reservation, model, capture, settlementInputTokens));
+        reservation = reserveGeneration(
+            request.user.profile.handle,
+            model,
+            reservationInputTokens,
+            maxOutputTokens,
+            settlementInputTokens,
+        );
+        instrumentResponse(response, capture => {
+            settleGeneration(reservation, model, capture, settlementInputTokens);
+            // 并发槽位跟随响应真正结束（finish/close）释放，handler 提前返回不会放大并发额度。
+            releaseConcurrencySlot();
+        });
+        responseInstrumented = true;
         request.body = trustedGenerationBody(request.body, maxOutputTokens);
         const directories = getUserDirectories(owner.handle);
         applySharedModel(request.body, model, directories);
@@ -716,12 +771,8 @@ router.post('/models/generate', generateRateLimiter, async (request, response) =
         }
         return response.status(500).json({ error: { message: publicError(error, '生成请求失败，请稍后重试') } });
     } finally {
-        const current = activeGenerationCounts.get(userHandle) || 1;
-        if (current <= 1) {
-            activeGenerationCounts.delete(userHandle);
-        } else {
-            activeGenerationCounts.set(userHandle, current - 1);
-        }
+        // 走到 instrumentResponse 之后的失败路径由 complete 回调释放；之前的失败（校验/预留）在这里兜底释放。
+        if (!responseInstrumented) releaseConcurrencySlot();
     }
 });
 
