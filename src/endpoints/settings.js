@@ -7,6 +7,8 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import bytes from 'bytes';
 
 import { SETTINGS_FILE } from '../constants.js';
+import { readSettingsFile } from '../aibar-settings.js';
+import { publicError, publicErrorStatus } from '../aibar-errors.js';
 import { getConfigValue, generateTimestamp, removeOldBackups } from '../util.js';
 import { getAllUserHandles, getUserDirectories } from '../users.js';
 import { getFileNameValidationFunction } from '../middleware/validateFileName.js';
@@ -205,13 +207,20 @@ export const router = express.Router();
 
 router.post('/save', function (request, response) {
     try {
+        if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) {
+            return response.status(400).json({ error: '设置必须是对象' });
+        }
         const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
-        writeFileAtomicSync(pathToSettings, JSON.stringify(request.body, null, 4), 'utf8');
+        const current = readSettingsFile(pathToSettings, { strict: true });
+        const settings = { ...request.body };
+        // 原生 ST 不维护 aibar 字段；以磁盘最新值为准，避免兼容界面覆盖 AIBAR 更新。
+        if (Object.hasOwn(current, 'aibar')) settings.aibar = current.aibar;
+        writeFileAtomicSync(pathToSettings, JSON.stringify(settings, null, 4), 'utf8');
         triggerAutoSave(request.user.profile.handle);
         response.send({ result: 'ok' });
     } catch (err) {
         console.error(err);
-        response.send(err);
+        response.status(publicErrorStatus(err, 500)).json({ error: publicError(err, '设置保存失败') });
     }
 });
 

@@ -3,6 +3,7 @@
 
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -87,6 +88,8 @@ const {
     validateGenerationMessages,
 } = modelsModule;
 const { charaFormatData } = await import('../src/endpoints/characters.js');
+const { router: settingsRouter } = await import('../src/endpoints/settings.js');
+const { toKey } = await import('../src/users.js');
 const { normalizeRegistrationHandle, registrationRateLimitKey } = publicModule;
 
 const settingsPath = path.join(userRoot, 'settings.json');
@@ -2266,6 +2269,118 @@ test('validateDiscordAttachmentUrl accepts only canonical Discord CDN attachment
 });
 
 const settingsRouteProfile = { handle: 'settings-route-user', name: 'Settings Route User', admin: false };
+
+test('native settings saves retain current AIBAR settings even with a stale or missing section', async (t) => {
+    const root = path.join(testRoot, 'native-settings-root');
+    fs.mkdirSync(root, { recursive: true });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const filePath = path.join(root, 'settings.json');
+    const currentAibar = { simple_ui_personas: [{ id: 'new-persona' }] };
+    fs.writeFileSync(filePath, JSON.stringify({ temperature: 0.5, aibar: currentAibar }));
+    const saveNativeSettings = getRouteHandler(settingsRouter, '/save');
+    for (const payload of [{ temperature: 0.8 }, { temperature: 0.8, aibar: { simple_ui_personas: [] } }]) {
+        const saved = await invokeRoute(saveNativeSettings, payload, settingsRouteProfile, { userDirectories: { ...directories, root } });
+        assert.equal(saved.status, 200);
+        assert.deepEqual(JSON.parse(fs.readFileSync(filePath, 'utf8')), { temperature: 0.8, aibar: currentAibar });
+    }
+});
+
+test('AIBAR settings writes cannot replace a corrupt existing settings file with partial settings', async (t) => {
+    const root = path.join(testRoot, 'corrupt-settings-root');
+    fs.mkdirSync(root, { recursive: true });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    t.mock.method(console, 'error', () => {});
+    const filePath = path.join(root, 'settings.json');
+    for (const original of ['{"aibar": {"simple_ui_personas":', '[]', 'null']) {
+        fs.writeFileSync(filePath, original);
+        const saved = await invokeRoute(saveAibarSettings, { theme: 'new' }, settingsRouteProfile, { userDirectories: { ...directories, root } });
+        assert.equal(saved.status, 409);
+        assert.equal(fs.readFileSync(filePath, 'utf8'), original);
+    }
+});
+
+function captureResponse() {
+    const response = new EventEmitter();
+    response.statusCode = 200;
+    response.sent = [];
+    response.status = function (code) { this.statusCode = code; return this; };
+    response.write = function (chunk) { this.sent.push(chunk); return true; };
+    response.end = function (chunk) {
+        if (chunk != null && typeof chunk !== 'function') this.sent.push(chunk);
+        this.emit('finish');
+        this.emit('close');
+        return this;
+    };
+    response.send = function (body) { return this.end(JSON.stringify(body)); };
+    response.json = response.send;
+    return response;
+}
+
+test('response capture preserves split UTF-8 and captures usage sent in end exactly once', () => {
+    const response = captureResponse();
+    let captured;
+    let completed = 0;
+    modelsModule.instrumentResponse(response, (capture) => { captured = capture; completed += 1; });
+    const frame = Buffer.from('data: {"choices":[{"delta":{"content":"你好世界"}}]}\n\n');
+    const boundary = frame.indexOf(Buffer.from('你')) + 1;
+    response.write(frame.subarray(0, boundary));
+    response.write(frame.subarray(boundary));
+    response.end('data: {"usage":{"prompt_tokens":12,"completion_tokens":4}}\n\ndata: [DONE]\n\n');
+    assert.equal(completed, 1);
+    assert.ok(captured.chunks.join('').includes('你好世界'));
+    const summary = summarizeCapture(captured, 99);
+    assert.equal(summary.inputTokens, 12);
+    assert.equal(summary.outputTokens, 4);
+    assert.equal(summary.usageReported, true);
+});
+
+test('response capture bounds retained UTF-8 bytes without truncating the response sent to the user', () => {
+    const response = captureResponse();
+    let captured;
+    modelsModule.instrumentResponse(response, (capture) => { captured = capture; });
+    const content = '你'.repeat(4 * 1024 * 1024);
+    response.write(content);
+    response.end();
+    assert.ok(Buffer.byteLength(captured.chunks.join('')) <= 8 * 1024 * 1024);
+    assert.equal(response.sent[0], content);
+    assert.equal(summarizeCapture(captured, 1).truncated, true);
+});
+
+test('JSON responses are captured once and still use provider-reported usage', () => {
+    const response = captureResponse();
+    let captured;
+    modelsModule.instrumentResponse(response, (capture) => { captured = capture; });
+    response.json({ choices: [{ message: { content: '你好' } }], usage: { prompt_tokens: 10, completion_tokens: 2 } });
+    const summary = summarizeCapture(captured, 99);
+    assert.equal(summary.inputTokens, 10);
+    assert.equal(summary.outputTokens, 2);
+    assert.equal(captured.chunks.join('').match(/你好/g).length, 1);
+});
+
+test('a failed settlement still releases the shared generation concurrency slot', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    t.mock.method(console, 'warn', () => {});
+    const handle = 'settlement-failure-user';
+    const owner = { handle: 'settlement-failure-admin', name: 'Test Admin', admin: true, enabled: true };
+    await storage.setItem(toKey(owner.handle), owner);
+    const model = await invokeRoute(saveModel, { id: 'settlement-failure-model', name: 'test', source: 'cohere', model: 'test', inputPrice: 0, outputPrice: 0 }, owner);
+    assert.equal(model.status, 200);
+    const db = getCommunityDb();
+    db.exec(`CREATE TRIGGER fail_test_settlement BEFORE UPDATE ON model_usage
+        WHEN OLD.user_handle = 'settlement-failure-user'
+        BEGIN SELECT RAISE(ABORT, 'test settlement failure'); END`);
+    t.after(() => db.exec('DROP TRIGGER IF EXISTS fail_test_settlement'));
+    for (let i = 0; i < 4; i++) {
+        const response = captureResponse();
+        await generateShared({
+            body: { aibar_model_id: 'settlement-failure-model', messages: [{ role: 'user', content: 'test' }] },
+            user: { profile: { handle, admin: false }, directories },
+            socket: new EventEmitter(),
+        }, response);
+        // 无 API Key 的 Cohere 路径在本地返回 400，不访问外部模型。
+        assert.equal(response.statusCode, 400, `request ${i + 1} must not be blocked by a leaked slot`);
+    }
+});
 
 test('AIBAR settings get returns the aibar section for every settings.json shape', async (t) => {
     // 用独立的账号根目录，避免污染其他测试共享的 settings.json 夹具。

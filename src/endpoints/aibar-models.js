@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 
 import express from 'express';
 import storage from 'node-persist';
@@ -424,28 +425,39 @@ export function settleGeneration(reservation, model, capture, estimatedInputToke
     }
 }
 
-function instrumentResponse(response, onComplete) {
+export function instrumentResponse(response, onComplete) {
     const capture = { body: null, chunks: [], capturedBytes: 0, statusCode: 200 };
-    const originalSend = response.send.bind(response);
+    const decoder = new StringDecoder('utf8');
     const originalWrite = response.write.bind(response);
-    response.send = function (body) {
-        capture.body = body;
-        return originalSend(body);
+    const originalEnd = response.end.bind(response);
+    const captureChunk = (chunk, encoding) => {
+        if (capture.capturedBytes >= MAX_CAPTURE_BYTES || chunk == null || typeof chunk === 'function') return;
+        const buffer = typeof chunk === 'string'
+            ? Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8')
+            : Buffer.from(chunk);
+        const retained = buffer.subarray(0, MAX_CAPTURE_BYTES - capture.capturedBytes);
+        const text = decoder.write(retained);
+        if (text) capture.chunks.push(text);
+        capture.capturedBytes += retained.length;
     };
+    // 在实际写出边界捕获：中文可跨网络分块，send/json 最终走 end，不再重复保存正文。
     response.write = function (chunk, ...args) {
-        if (capture.capturedBytes < MAX_CAPTURE_BYTES && chunk !== undefined && chunk !== null) {
-            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
-            const remaining = MAX_CAPTURE_BYTES - capture.capturedBytes;
-            capture.chunks.push(text.slice(0, remaining));
-            capture.capturedBytes += Math.min(remaining, Buffer.byteLength(text));
-        }
+        captureChunk(chunk, args[0]);
         return originalWrite(chunk, ...args);
+    };
+    response.end = function (chunk, ...args) {
+        captureChunk(chunk, args[0]);
+        return originalEnd(chunk, ...args);
     };
 
     let completed = false;
     const complete = () => {
         if (completed) return;
         completed = true;
+        if (capture.capturedBytes < MAX_CAPTURE_BYTES) {
+            const tail = decoder.end();
+            if (tail) capture.chunks.push(tail);
+        }
         capture.statusCode = response.statusCode;
         try {
             onComplete(capture);
@@ -741,9 +753,12 @@ router.post('/models/generate', generateRateLimiter, async (request, response) =
             settlementInputTokens,
         );
         instrumentResponse(response, capture => {
-            settleGeneration(reservation, model, capture, settlementInputTokens);
-            // 并发槽位跟随响应真正结束（finish/close）释放，handler 提前返回不会放大并发额度。
-            releaseConcurrencySlot();
+            try {
+                settleGeneration(reservation, model, capture, settlementInputTokens);
+            } finally {
+                // 结算失败也必须归还并发槽位，避免用户永久卡在 429。
+                releaseConcurrencySlot();
+            }
         });
         responseInstrumented = true;
         request.body = trustedGenerationBody(request.body, maxOutputTokens);

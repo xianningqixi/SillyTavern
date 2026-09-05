@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import express from 'express';
 import sanitize from 'sanitize-filename';
 import { sync as writeFileSyncAtomic } from 'write-file-atomic';
+import { readSettingsFile } from '../aibar-settings.js';
 
 import { publicError, publicErrorStatus } from '../aibar-errors.js';
 import { createUserRateLimiter } from '../aibar-rate-limit.js';
@@ -529,16 +530,9 @@ router.get('/images/file/:fileName', (request, response) => {
 // AIBAR 设置的合并写入上限：aibar 键下存放预设/人设/MOD 等，正常远小于该值。
 const AIBAR_SETTINGS_MAX_BYTES = 10 * 1024 * 1024;
 
-function readUserSettings(request) {
+function readUserSettings(request, options) {
     const filePath = path.join(request.user.directories.root, SETTINGS_FILE);
-    if (!fs.existsSync(filePath)) return { filePath, settings: {} };
-    try {
-        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        return { filePath, settings: (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {} };
-    } catch {
-        // settings.json 损坏时不阻塞 AIBAR 设置读写；上游 /api/settings/get 同样按空处理。
-        return { filePath, settings: {} };
-    }
+    return { filePath, settings: readSettingsFile(filePath, options) };
 }
 
 function getAibarSection(settings) {
@@ -564,10 +558,10 @@ router.post('/settings/save', (request, response) => {
         if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
             return response.status(400).json({ error: '设置更新必须是对象' });
         }
-        const { filePath, settings } = readUserSettings(request);
+        const { filePath, settings } = readUserSettings(request, { strict: true });
         const merged = { ...settings, aibar: { ...getAibarSection(settings), ...updates } };
         const serialized = JSON.stringify(merged, null, 4);
-        if (serialized.length > AIBAR_SETTINGS_MAX_BYTES) {
+        if (Buffer.byteLength(serialized, 'utf8') > AIBAR_SETTINGS_MAX_BYTES) {
             return response.status(413).json({ error: '设置内容过大，无法保存' });
         }
         writeFileSyncAtomic(filePath, serialized, 'utf8');
@@ -575,6 +569,6 @@ router.post('/settings/save', (request, response) => {
         return response.json({ settings: merged.aibar });
     } catch (error) {
         console.error('AIBAR settings save failed:', error);
-        return response.status(500).json({ error: publicError(error, '设置保存失败') });
+        return response.status(publicErrorStatus(error, 500)).json({ error: publicError(error, '设置保存失败') });
     }
 });
