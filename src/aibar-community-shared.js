@@ -7,6 +7,7 @@ import { sync as writeFileSyncAtomic } from 'write-file-atomic';
 
 import { getCommunityDb, getCommunityRoot } from './aibar-community-db.js';
 import { ensureCommunityCoverPreview } from './aibar-community-previews.js';
+import { readSettingsFile } from './aibar-settings.js';
 import { readCharacterData } from './endpoints/characters.js';
 
 const MAX_TAGS = 8;
@@ -32,7 +33,7 @@ export function safeJson(value, fallback = {}) {
 
 export function readUserSettings(request) {
     const settingsPath = path.join(request.user.directories.root, 'settings.json');
-    const settings = fs.existsSync(settingsPath) ? safeJson(fs.readFileSync(settingsPath, 'utf8'), {}) : {};
+    const settings = readSettingsFile(settingsPath, { strict: true });
     return {
         settingsPath,
         settings: settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {},
