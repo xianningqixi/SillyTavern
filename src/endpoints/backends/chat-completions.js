@@ -411,7 +411,13 @@ async function sendClaudeRequest(request, response) {
 
             /** @type {any} */
             const generateResponseJson = await generateResponse.json();
-            const responseText = generateResponseJson?.content?.[0]?.text || '';
+            // 思考或工具块可能在正文之前，按原顺序合并正文，避免把分析内容作为回复。
+            const responseText = Array.isArray(generateResponseJson?.content)
+                ? generateResponseJson.content
+                    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+                    .map(block => block.text)
+                    .join('')
+                : '';
             console.debug('Claude response:', generateResponseJson);
 
             // Wrap it back to OAI format + save the original content
