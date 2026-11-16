@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -50,7 +51,7 @@ const [
     { router: aibarRouter, validateDiscordAttachmentUrl },
     { getChatDataStrict },
     { isCsrfProtectionDisabled, setupPrivateEndpoints },
-    { getClaudeApiConfig },
+    { getClaudeApiConfig, generateChatCompletion },
     { createUserRateLimiter },
     { publicError },
 ] = await Promise.all([
@@ -839,6 +840,54 @@ test('Claude requests use the native Anthropic endpoint and authentication contr
         apiKeyHeader: 'x-api-key',
         headers: { 'anthropic-version': '2023-06-01' },
     });
+});
+
+test('non-streaming Claude replies join text blocks without exposing thinking or tool blocks', async (t) => {
+    t.mock.method(console, 'debug', () => {});
+    let content = [];
+    const usage = { input_tokens: 12, output_tokens: 34 };
+    const upstream = http.createServer((request, response) => {
+        request.resume();
+        response.setHeader('Content-Type', 'application/json');
+        response.end(JSON.stringify({ content, usage }));
+    });
+    await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => upstream.close(resolve)));
+
+    for (const fixture of [
+        {
+            blocks: [
+                { type: 'thinking', thinking: 'private reasoning', text: 'not final text' },
+                { type: 'text', text: '{"questions":[' },
+                { type: 'tool_use', text: 'not final text' },
+                { type: 'text', text: '{"question":"Which tone?"}]}' },
+            ],
+            expected: '{"questions":[{"question":"Which tone?"}]}',
+        },
+        { blocks: [{ type: 'text', text: 'ordinary reply' }], expected: 'ordinary reply' },
+        { blocks: [{ type: 'thinking', thinking: 'private reasoning' }], expected: '' },
+        { blocks: null, expected: '' },
+    ]) {
+        content = fixture.blocks;
+        let reply;
+        let status = 200;
+        await generateChatCompletion({
+            body: {
+                chat_completion_source: 'claude', model: 'claude-sonnet-5',
+                reverse_proxy: `http://127.0.0.1:${upstream.address().port}/v1`,
+                proxy_password: 'test-key', stream: false, max_tokens: 4096,
+                messages: [{ role: 'user', content: 'Return a JSON object.' }],
+            },
+            user: { directories }, socket: new EventEmitter(),
+        }, {
+            status(code) { status = code; return this; },
+            send(value) { reply = value; return this; },
+        });
+        assert.equal(status, 200);
+        assert.equal(reply.choices[0].message.content, fixture.expected);
+        assert.deepEqual(reply.content, fixture.blocks);
+        assert.deepEqual(reply.usage, usage);
+    }
 });
 
 test('editing a shared model preserves its credential owner', async () => {
